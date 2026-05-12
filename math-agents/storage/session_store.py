@@ -88,12 +88,18 @@ def save_session(
         encoding="utf-8",
     )
 
-    # Export manuscript to markdown
+    # Export manuscript to markdown and LaTeX
     try:
         from output.exporter import export_manuscript
         export_manuscript(manuscript, session_dir)
     except Exception as e:
-        print(f"[WARNING] Export failed: {e}")
+        print(f"[WARNING] Markdown export failed: {e}")
+
+    try:
+        from output.exporter import export_latex
+        export_latex(manuscript, session_dir)
+    except Exception as e:
+        print(f"[WARNING] LaTeX export failed: {e}")
 
 
 # ---------------------------------------------------------------------------

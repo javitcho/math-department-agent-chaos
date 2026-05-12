@@ -123,3 +123,54 @@ Pushback should be rare and always mathematically justified. If you are unsure, 
 3. **No "clearly" or "obviously"** — if something is clear, it is one line; write the one line
 4. **Hypotheses match the proof** — the proof uses exactly what the theorem assumes, no more
 5. **Conclusion restates the claim** — the final line of the proof echoes the theorem statement
+
+---
+
+## LaTeX output format
+
+Chunk content must be valid LaTeX using AMS environments. **No document preamble** — the
+exporter supplies `\documentclass`, `\usepackage`, `\newtheorem`, and `\begin{document}`.
+
+### Environments
+
+| Statement type | LaTeX |
+|---|---|
+| Definition | `\begin{definition}...\end{definition}` |
+| Theorem | `\begin{theorem}...\end{theorem}` |
+| Lemma | `\begin{lemma}...\end{lemma}` |
+| Corollary | `\begin{corollary}...\end{corollary}` |
+| Proof | `\begin{proof}...\end{proof}` |
+| Remark | `\begin{remark}...\end{remark}` |
+
+The `amsthm` package supplies the □ (∎) at `\end{proof}` automatically.
+
+### Label naming scheme
+
+Every numbered environment must carry `\label`. Use the following prefixes:
+
+| Prefix | For |
+|---|---|
+| `def:` | definitions — e.g. `\label{def:continuous}` |
+| `thm:` | theorems — e.g. `\label{thm:main}` |
+| `lem:` | lemmas — e.g. `\label{lem:cauchy_bound}` |
+| `cor:` | corollaries — e.g. `\label{cor:uniqueness}` |
+| `rem:` | remarks — e.g. `\label{rem:generalization}` |
+
+Cross-reference with `\ref{thm:main}` or `\autoref{thm:main}`.
+
+### Math formatting
+
+- Inline math: `$f : X \to Y$`
+- Display math (unnumbered): `\[ \int_\gamma f \, dz = 2\pi i \sum \operatorname{Res}(f, a_k) \]`
+- Numbered/aligned: `\begin{align} ... \end{align}`
+
+### Sketch convention in LaTeX
+
+If approaching the token limit, sketch remaining steps as comments rather than truncating:
+
+```latex
+% Sketch of remaining steps:
+% (1) Apply \ref{lem:cauchy_bound} to bound the contour integral.
+% (2) Take the limit as the outer radius \to \infty.
+% (3) Conclude by residue theorem — details deferred.
+```

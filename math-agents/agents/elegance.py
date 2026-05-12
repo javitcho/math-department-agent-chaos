@@ -50,6 +50,7 @@ ASSESS:
 - Unity: does it reveal something deep about the structure?
 
 OUTPUT FORMAT:
+SINCE LAST REVIEW: [one line — what changed in this chunk since your prior review, or "first review"]
 SCORE: [1-10]
 ISSUES: [one line per issue, or "none"]
 SUGGESTIONS: [one line per suggestion, or "none"]
@@ -59,9 +60,14 @@ MEMORY NOTE:
 
 CONSTRAINTS:
 - 200 tokens max output
-- Be specific. "Step 3 could use the universal property directly, eliminating the explicit construction" not "the proof could be cleaner"
+- Be specific and reference LaTeX environments/labels. E.g.:
+  "\\begin{proof} of \\ref{thm:main}: step 3 could invoke the universal property directly via \\ref{lem:univ_prop}"
+  not "the proof could be cleaner"
 - Score honestly. 5 is average. 8+ means genuinely beautiful.
-- Do not repeat suggestions from prior rounds that have already been addressed."""
+- Do not repeat suggestions from prior rounds that have already been addressed.
+- Do not propose alternative proofs or suggest new mathematical content. Evaluate and improve what is already written.
+- If a suggestion would require rewriting more than one sentence, do not list it as a SUGGESTIONS item. Instead prefix it with "STRUCTURAL NOTE:" — the orchestrator will handle it.
+- The SINCE LAST REVIEW line is mandatory. It must appear before SCORE."""
 
     def _build_user_message(self, state: RoundState, memory: AgentMemory, extra: dict) -> str:
         state_block = self._serialize_state(state)

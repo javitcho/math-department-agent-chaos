@@ -166,12 +166,14 @@ def _cmd_export(session_id: str):
         display_error(f"Could not load session '{session_id}': {e}")
         sys.exit(1)
 
-    from output.exporter import export_manuscript
+    from output.exporter import export_manuscript, export_latex
     from pathlib import Path
     sessions_root = Path(__file__).parent / "sessions"
     session_dir = sessions_root / session_id
-    out_path = export_manuscript(manuscript, session_dir)
-    display_success(f"Manuscript exported to: {out_path}")
+    md_path = export_manuscript(manuscript, session_dir)
+    display_success(f"Markdown exported to: {md_path}")
+    tex_path = export_latex(manuscript, session_dir)
+    display_success(f"LaTeX exported to:   {tex_path}")
 
 
 def _cmd_inspect(session_id: str):

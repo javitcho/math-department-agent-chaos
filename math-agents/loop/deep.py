@@ -79,7 +79,9 @@ class UserInputHandler:
                     if note:
                         self._note_queue.append(note)
                         console.print(f"[dim]Note queued: {note}[/dim]")
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
+                break
+            except KeyboardInterrupt:
                 self._quit_flag = True
                 break
 
@@ -321,7 +323,9 @@ def run_deep(
                     display_info("[Deep] SERENDIPITY — pausing for user decision.")
                     try:
                         answer = input("Continue? [y/n]: ").strip().lower()
-                    except (EOFError, KeyboardInterrupt):
+                    except EOFError:
+                        answer = "y"
+                    except KeyboardInterrupt:
                         answer = "n"
                     if answer != "y":
                         save_session(manuscript, state, memories)

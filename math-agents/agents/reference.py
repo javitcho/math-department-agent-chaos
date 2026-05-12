@@ -47,8 +47,8 @@ CHECK FOR:
 
 OUTPUT FORMAT:
 PRIOR ART: [name, date, brief note — or "none found"]
-CORRECTIONS: [list of citation issues — or "none"]
-CONNECTIONS: [any cross-domain links — be specific about what connects to what]
+CORRECTIONS: [list of citation issues referencing LaTeX labels, e.g. "\\ref{{thm:residue}}: attr. to wrong author" — or "none"]
+CONNECTIONS: [any cross-domain links — be specific; reference chunk labels where relevant]
 NOVEL: yes / no / unclear
 
 MEMORY NOTE:
@@ -58,7 +58,8 @@ CONSTRAINTS:
 - 250 tokens max output
 - Do not repeat searches you already did (check your memory)
 - If you find a cross-domain connection, mark it with !! so the orchestrator flags it
-- "none found" is a complete and valid output for any section{skills_block}"""
+- "none found" is a complete and valid output for any section
+- Output format is fixed. No headers, no sections, no markdown structure. Four fields only: PRIOR ART, CORRECTIONS, CONNECTIONS, NOVEL. Each field is one line or at most two lines. If you have more to say, cut it.{skills_block}"""
 
     def _build_user_message(self, state: RoundState, memory: AgentMemory, extra: dict) -> str:
         state_block = self._serialize_state(state)

@@ -41,7 +41,7 @@ METHOD:
 OUTPUT FORMAT:
 If found:
   COUNTEREXAMPLE FOUND
-  Claim tested: [claim]
+  Claim tested: [claim — reference by LaTeX label if available, e.g. \ref{thm:main}]
   Counterexample: [explicit construction, ≤3 lines]
   Why it breaks the claim: [one sentence]
 

@@ -8,13 +8,13 @@ class Config:
     model: str = "claude-sonnet-4-6"
 
     # Token budgets (max output per agent call)
-    max_tokens_rep: int = 700
-    max_tokens_logic: int = 150
-    max_tokens_counterex: int = 150
-    max_tokens_reference: int = 250
-    max_tokens_elegance: int = 200
-    max_tokens_orchestrator: int = 400
-    max_tokens_decomposer: int = 400
+    max_tokens_rep: int = 1800
+    max_tokens_logic: int = 300
+    max_tokens_counterex: int = 250
+    max_tokens_reference: int = 400
+    max_tokens_elegance: int = 300
+    max_tokens_orchestrator: int = 800
+    max_tokens_decomposer: int = 600
 
     # Loop limits
     max_rounds_per_chunk: int = 4

@@ -57,8 +57,16 @@ class RepAgent(BaseAgent):
         skills_block = f"\n\n{self.skills}" if self.skills else ""
         return f"""TASK:
 Update the current chunk of the mathematical manuscript based on the orchestrator's directive.
-Write in standard mathematical exposition: Definition / Theorem / Proof / Remark format.
-Use unicode math symbols (∀, ∃, →, ⊗, ∈, ⊂, ℝ, ℚ, ℤ, ℕ, ℂ, √, ∞, ≤, ≥, ≠, ⟹, ⟺, etc.) for readability.
+Write valid LaTeX content using AMS environments. No document preamble — chunk content only.
+
+LATEX REQUIREMENTS:
+- Use AMS environments: \\begin{{definition}}...\\end{{definition}}, \\begin{{theorem}}...\\end{{theorem}},
+  \\begin{{proof}}...\\end{{proof}}, \\begin{{lemma}}...\\end{{lemma}},
+  \\begin{{remark}}...\\end{{remark}}, \\begin{{corollary}}...\\end{{corollary}}
+- Label every numbered environment: \\label{{def:name}}, \\label{{thm:name}}, \\label{{lem:name}}, etc.
+- Inline math: $...$   Display math: \\[...\\] or \\begin{{align}}...\\end{{align}}
+- Packages available: amsmath, amsthm, amssymb, mathtools, hyperref
+- Cross-reference with \\ref{{label}} or \\autoref{{label}}
 
 INPUTS YOU RECEIVE:
 - State object (established results, open flags, round goal)
@@ -68,7 +76,7 @@ INPUTS YOU RECEIVE:
 
 OUTPUT FORMAT:
 ---CHUNK---
-[complete updated chunk text]
+[complete updated chunk as LaTeX, no preamble]
 ---END CHUNK---
 
 PUSHBACK (only if you disagree with the directive for a clear mathematical reason, otherwise omit):
@@ -80,8 +88,8 @@ MEMORY NOTE:
 CONSTRAINTS:
 - Output the complete chunk text, not a diff
 - 600 tokens max for chunk content
-- If you are approaching the token limit, sketch the remaining steps explicitly:
-  "Remaining: (1) verify X, (2) handle edge case Y — details deferred"
+- If approaching the token limit, sketch remaining steps as LaTeX comments:
+  % Sketch: (1) verify X  (2) handle edge case Y — details deferred
   Do not truncate silently.
 - Do not rewrite chunks that are already APPROVED{skills_block}"""
 
