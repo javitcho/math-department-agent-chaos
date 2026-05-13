@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.Python
+build/
+dist/
+.eggs/
+
+# Environment
+.env
+*.env.local
+
+# Sessions (written on every agent call)
+math-agents/sessions/*
+!math-agents/sessions/.gitkeep
+
+# Node / frontend
+math-agents/web/node_modules/
+math-agents/web/dist/
+math-agents/web/.vite/
+
+# macOS
+.DS_Store
+**/.DS_Store

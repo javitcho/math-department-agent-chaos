@@ -7,19 +7,19 @@ class Config:
     model: str = "claude-sonnet-4-6"
 
     # Token budgets — output tokens per agent call
-    max_tokens_rep:           int = 400   # diffs are small
+    max_tokens_rep:           int = 700   # LaTeX chunk content
     max_tokens_logic:         int = 100
     max_tokens_counterex:     int = 100
     max_tokens_reference:     int = 200   # opt-in, round 1 only
     max_tokens_elegance:      int = 150
-    max_tokens_orchestrator:  int = 300   # 4-field schema
-    max_tokens_decomposer:    int = 300
+    max_tokens_orchestrator:  int = 800   # raised from 400 to prevent JSON truncation
+    max_tokens_decomposer:    int = 400
 
     # Scout-specific overrides (even tighter budget)
     scout_max_tokens_rep:           int = 400
     scout_max_tokens_logic:         int = 100
     scout_max_tokens_counterex:     int = 100
-    scout_max_tokens_orchestrator:  int = 150
+    scout_max_tokens_orchestrator:  int = 250
 
     # Loop limits
     max_rounds_per_chunk:   int = 4
