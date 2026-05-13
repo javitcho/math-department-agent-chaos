@@ -108,11 +108,11 @@ export default function ManuscriptPanel({ manuscript }) {
     )
   }
 
-  const { chunks, current_chunk_id } = manuscript
+  const { nodes, current_chunk_id } = manuscript
 
   return (
     <div ref={scrollRef} style={{ flex: 1, overflow: 'auto', padding: '28px 24px' }}>
-      {chunks.map(chunk => (
+      {(nodes || []).map(chunk => (
         <ChunkView
           key={chunk.id}
           chunk={chunk}

@@ -336,14 +336,17 @@ def display_scout_result(
         box=box.ROUNDED,
     ))
 
-    # Decomposition chunks
-    chunks = decomp.get("chunks", [])
-    if chunks:
-        chunk_lines = [f"  {i+1}. [{c['id']}] {c['title']} — {c.get('description', '')}"
-                       for i, c in enumerate(chunks)]
+    # Decomposition nodes
+    nodes = decomp.get("nodes", [])
+    if nodes:
+        node_lines = [
+            f"  {i+1}. [{n['id']}] ({n.get('type','?')}) {n['title']} — {n.get('description', '')}"
+            + (f" deps: {n.get('depends_on', [])}" if n.get("depends_on") else "")
+            for i, n in enumerate(nodes)
+        ]
         console.print(Panel(
-            "\n".join(chunk_lines),
-            title="[bold green]ROADMAP[/bold green]",
+            "\n".join(node_lines),
+            title="[bold green]DEPENDENCY GRAPH[/bold green]",
             border_style="green",
             box=box.ROUNDED,
         ))
@@ -351,7 +354,7 @@ def display_scout_result(
     # Display the round (scout uses one round with 3 agents)
     display_round(
         round_num=1,
-        chunk_title=decomp.get("chunks", [{}])[0].get("title", "Scout Chunk") if decomp.get("chunks") else "Main Claim",
+        chunk_title=nodes[0].get("title", "Scout Chunk") if nodes else "Main Claim",
         rep_output=rep_output,
         logic_flags=logic_flags,
         counterex_result=counterex_result,
@@ -381,6 +384,56 @@ def display_scout_result(
 # ---------------------------------------------------------------------------
 # Session listing display
 # ---------------------------------------------------------------------------
+
+def display_graph_status(manuscript) -> None:
+    """
+    Print a compact graph status table showing all nodes and their status.
+
+    Example output:
+      GRAPH STATUS
+        def_rational    ✓ approved
+        lem_euclid      ✓ approved
+        thm_sqrt2       ◎ under_review  ← current
+        proof_sqrt2     ○ draft         [waiting on thm_sqrt2]
+    """
+    from models.signals import ChunkStatus
+
+    _STATUS_SYMBOLS = {
+        ChunkStatus.DRAFT:        ("○", "dim"),
+        ChunkStatus.UNDER_REVIEW: ("◎", "yellow"),
+        ChunkStatus.FLAGGED:      ("✗", "red"),
+        ChunkStatus.NEEDS_REWORK: ("↺", "red"),
+        ChunkStatus.APPROVED:     ("✓", "green"),
+        ChunkStatus.ABANDONED:    ("—", "dim"),
+    }
+
+    console.print()
+    console.print("[bold]GRAPH STATUS[/bold]")
+    for nid in manuscript.traversal_order:
+        node = manuscript.nodes.get(nid)
+        if node is None:
+            continue
+        sym, color = _STATUS_SYMBOLS.get(node.status, ("?", "white"))
+        current_marker = "  [bold cyan]← current[/bold cyan]" if nid == manuscript.current_chunk_id else ""
+        review_marker = "  [dim][review requested][/dim]" if node.review_requested else ""
+
+        # Show which dependencies are not yet approved
+        waiting_on = [
+            dep_id for dep_id in node.depends_on
+            if dep_id in manuscript.nodes
+            and manuscript.nodes[dep_id].status != ChunkStatus.APPROVED
+        ]
+        waiting_str = ""
+        if waiting_on and node.status == ChunkStatus.DRAFT:
+            waiting_str = f"  [dim][waiting on {', '.join(waiting_on)}][/dim]"
+
+        type_label = f"[dim]{node.type.value}[/dim]"
+        console.print(
+            f"  [{color}]{sym}[/{color}]  {nid:<28} [{color}]{node.status.value}[/{color}]"
+            f"  {type_label}{current_marker}{review_marker}{waiting_str}"
+        )
+    console.print()
+
 
 def display_session_list(sessions: list) -> None:
     """Display a table of recent sessions."""
@@ -415,31 +468,46 @@ def display_inspect(manuscript, state, memories) -> None:
     console.print()
 
     # Manuscript overview
+    node_count = len(manuscript.nodes) if hasattr(manuscript, "nodes") else 0
     lines = [
         f"[bold]Topic:[/bold] {manuscript.topic}",
         f"[bold]Mode:[/bold] {manuscript.mode.value}",
         f"[bold]Session:[/bold] {manuscript.session_id}",
         f"[bold]Created:[/bold] {manuscript.created_at}",
         f"[bold]Current chunk:[/bold] {manuscript.current_chunk_id}",
+        f"[bold]Nodes:[/bold] {node_count}",
+        f"[bold]Traversal order:[/bold] {' → '.join(manuscript.traversal_order)}",
         "",
         "[bold]Global context:[/bold]",
         manuscript.global_context or "(none)",
     ]
     console.print(Panel("\n".join(lines), title="[bold green]Manuscript[/bold green]", border_style="green"))
 
-    # Chunks
-    for chunk in manuscript.chunks:
-        chunk_lines = [
-            f"[bold]Status:[/bold] {chunk.status.value}",
-            f"[bold]Rounds:[/bold] created {chunk.round_created}, last modified {chunk.round_last_modified}",
-            f"[bold]Approved rounds:[/bold] {chunk.approved_by_rounds}",
-            f"[bold]Flags:[/bold] {chunk.flags or 'none'}",
+    # Graph status table
+    display_graph_status(manuscript)
+
+    # Node detail panels
+    for nid in manuscript.traversal_order:
+        node = manuscript.nodes.get(nid)
+        if node is None:
+            continue
+        unresolved = [f for f in node.flags if not f.resolved]
+        resolved = [f for f in node.flags if f.resolved]
+        node_lines = [
+            f"[bold]Type:[/bold] {node.type.value}",
+            f"[bold]Status:[/bold] {node.status.value}",
+            f"[bold]Rounds:[/bold] created {node.round_created}, last modified {node.round_last_modified}",
+            f"[bold]Depends on:[/bold] {node.depends_on or 'none'}",
+            f"[bold]Dependents:[/bold] {node.dependents or 'none'}",
+            f"[bold]Review requested:[/bold] {node.review_requested}",
+            f"[bold]Unresolved flags:[/bold] {[f.text for f in unresolved] or 'none'}",
+            f"[bold]Resolved flags:[/bold] {len(resolved)}",
             "",
-            chunk.content or "(empty)",
+            node.content or "(empty)",
         ]
         console.print(Panel(
-            "\n".join(chunk_lines),
-            title=f"[bold blue]Chunk: {chunk.id} — {chunk.title}[/bold blue]",
+            "\n".join(node_lines),
+            title=f"[bold blue]Node: {node.id} — {node.title}[/bold blue]",
             border_style="blue",
         ))
 

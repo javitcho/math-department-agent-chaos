@@ -65,7 +65,7 @@ CONSTRAINTS:
 - Output format is fixed. No headers, no sections, no markdown structure. Four fields only: PRIOR ART, CORRECTIONS, CONNECTIONS, NOVEL. Each field is one line or at most two lines. If you have more to say, cut it.{skills_block}"""
 
     def _build_user_message(self, state: RoundState, memory: AgentMemory, extra: dict) -> str:
-        state_block = self._serialize_state(state)
+        state_block = self._serialize_state(state, extra)
         memory_block = self._serialize_memory(memory)
 
         return f"""{state_block}

@@ -1,18 +1,28 @@
 import json
-import time
 
 from agents.orchestrator import strip_json_fences
 from agents.base import BaseAgent
 from config import Config
+from models.document import ChunkNode, rebuild_dependents, topological_sort
+from models.signals import ChunkStatus, ChunkType, SessionMode
 from models.state import AgentMemory, RoundState
-from models.signals import SessionMode, StoppingSignal
+
+
+_TYPE_MAP = {
+    "definition": ChunkType.DEFINITION,
+    "lemma":      ChunkType.LEMMA,
+    "theorem":    ChunkType.THEOREM,
+    "proof":      ChunkType.PROOF,
+    "corollary":  ChunkType.COROLLARY,
+    "remark":     ChunkType.REMARK,
+    "section":    ChunkType.SECTION,
+}
 
 
 class DecomposerAgent(BaseAgent):
     """
-    First agent called per session. Breaks the topic into a structured roadmap.
+    First agent called per session. Breaks the topic into a dependency graph.
     Does not run again unless the orchestrator explicitly resets.
-    Has no skills directory (relies on model knowledge).
     """
 
     def __init__(self, config: Config):
@@ -20,11 +30,10 @@ class DecomposerAgent(BaseAgent):
 
     def decompose(self, topic: str) -> dict:
         """
-        Decompose a topic string into a structured roadmap.
-        Returns a parsed dict with chunks, claims, lemmas, etc.
-        Falls back to a minimal single-chunk structure on error.
+        Decompose a topic string into a structured node graph.
+        Returns a parsed dict with nodes, global_context, etc.
+        Falls back to a minimal single-node structure on error.
         """
-        # Build a minimal state and memory to satisfy the BaseAgent interface
         state = RoundState(
             round=0,
             mode=SessionMode.SCOUT,
@@ -33,7 +42,7 @@ class DecomposerAgent(BaseAgent):
             current_chunk_title="Initial Decomposition",
             focus_text=topic,
             open_flags=[],
-            round_goal="Decompose the topic into a structured roadmap",
+            round_goal="Decompose the topic into a dependency graph",
             directive_for_rep="",
         )
         memory = AgentMemory(agent_id="decomposer", session_id="init", entries=[])
@@ -50,36 +59,60 @@ class DecomposerAgent(BaseAgent):
 
     def _build_system_prompt(self) -> str:
         return """TASK:
-Given a mathematical topic or theorem, produce a structured decomposition as a roadmap
-for a research session.
+Given a mathematical topic or theorem, produce a dependency graph of nodes
+as a roadmap for a research session.
 
 OUTPUT FORMAT (JSON, no markdown fences):
 {
-  "core_claim": "the central statement or research question, one sentence",
-  "key_definitions": ["def1", "def2"],
-  "definitions_order": ["which definitions depend on which"],
-  "lemmas_needed": ["lemma1 — brief description"],
-  "proof_strategy": "suggested approach, 2-3 sentences max",
-  "expected_connections": ["connection to other area — why it might appear"],
-  "chunks": [
-    {"id": "chunk_id", "title": "short title", "description": "one sentence"}
+  "title": "short topic title",
+  "nodes": [
+    {
+      "id": "def_rational",
+      "title": "Definition: Rational Number",
+      "type": "definition",
+      "description": "one sentence",
+      "depends_on": []
+    },
+    {
+      "id": "thm_sqrt2",
+      "title": "Theorem: sqrt(2) is irrational",
+      "type": "theorem",
+      "description": "one sentence",
+      "depends_on": ["def_rational"]
+    },
+    {
+      "id": "proof_sqrt2",
+      "title": "Proof: sqrt(2) is irrational",
+      "type": "proof",
+      "description": "one sentence",
+      "depends_on": ["thm_sqrt2", "def_rational"]
+    }
   ],
-  "scout_priority": "which chunk to examine first in scout mode — id"
+  "global_context": "2-3 sentence summary of the topic",
+  "scout_priority": "id of the most important node to examine first"
 }
 
+DEPENDENCY RULES:
+- Every proof node must depend_on its theorem node
+- Definitions depend on nothing unless one definition uses another
+- Lemmas used in a proof must appear in that proof's depends_on
+- A remark depends on the chunk it remarks on
+- Aim for 3-8 nodes. One concept per node. No exceptions.
+
+TYPE VALUES: definition | lemma | theorem | proof | corollary | remark | section
+
 CONSTRAINTS:
-- Chunks should map to logical units: one definition, one lemma, one proof step, one remark
-- 4-8 chunks for a typical topic
-- 500 tokens max total output
-- No markdown fences in your output — raw JSON only"""
+- 400 tokens max output
+- No markdown fences — raw JSON only
+- depends_on lists only ids that appear in this nodes array"""
 
     def _build_user_message(self, state: RoundState, memory: AgentMemory, extra: dict) -> str:
         topic = extra.get("topic", state.focus_text)
-        return f"""Decompose the following mathematical topic into a structured research roadmap:
-
-TOPIC: {topic}
-
-Produce the JSON roadmap now."""
+        return (
+            "Decompose the following mathematical topic into a dependency graph:\n\n"
+            "TOPIC: " + topic + "\n\n"
+            "Produce the JSON graph now."
+        )
 
     # ------------------------------------------------------------------
     # Parsing
@@ -90,39 +123,64 @@ Produce the JSON roadmap now."""
             cleaned = strip_json_fences(raw)
             data = json.loads(cleaned)
 
-            # Ensure chunks is a list of dicts with required keys
-            chunks = data.get("chunks", [])
-            validated_chunks = []
-            for i, c in enumerate(chunks):
-                validated_chunks.append({
-                    "id": c.get("id", f"chunk_{i+1}"),
-                    "title": c.get("title", f"Chunk {i+1}"),
-                    "description": c.get("description", ""),
+            nodes_data = data.get("nodes", [])
+            validated = []
+            for i, n in enumerate(nodes_data):
+                node_id = n.get("id", f"chunk_{i+1}")
+                validated.append({
+                    "id": node_id,
+                    "title": n.get("title", f"Chunk {i+1}"),
+                    "type": n.get("type", "section"),
+                    "description": n.get("description", ""),
+                    "depends_on": [d for d in n.get("depends_on", []) if isinstance(d, str)],
                 })
-            data["chunks"] = validated_chunks
-            data.setdefault("core_claim", topic)
-            data.setdefault("key_definitions", [])
-            data.setdefault("definitions_order", [])
-            data.setdefault("lemmas_needed", [])
-            data.setdefault("proof_strategy", "")
-            data.setdefault("expected_connections", [])
-            data.setdefault("scout_priority", validated_chunks[0]["id"] if validated_chunks else "chunk_1")
+
+            data["nodes"] = validated
+            data.setdefault("title", topic)
+            data.setdefault("global_context", "")
+            data.setdefault("scout_priority", validated[0]["id"] if validated else "chunk_1")
             data["raw"] = raw
             return data
 
         except Exception as e:
             print(f"[WARNING] Decomposer JSON parse failed: {e}")
             print(f"[WARNING] Raw decomposer output: {raw[:500]}")
-            # Return a minimal single-chunk structure so the loop can continue
             return {
-                "core_claim": topic,
-                "key_definitions": [],
-                "definitions_order": [],
-                "lemmas_needed": [],
-                "proof_strategy": "Standard approach",
-                "expected_connections": [],
-                "chunks": [{"id": "main_claim", "title": "Main Claim", "description": topic}],
+                "title": topic,
+                "nodes": [{"id": "main_claim", "title": "Main Claim",
+                            "type": "section", "description": topic, "depends_on": []}],
+                "global_context": "",
                 "scout_priority": "main_claim",
                 "raw": raw,
                 "parse_error": str(e),
             }
+
+    def build_nodes(self, decomp: dict) -> dict:
+        """
+        Convert parsed decomp dict into a Dict[str, ChunkNode] with
+        dependents populated and traversal_order computed.
+        Returns {"nodes": ..., "traversal_order": ..., "global_context": ...}.
+        """
+        nodes_data = decomp.get("nodes", [])
+        nodes: dict = {}
+        for nd in nodes_data:
+            chunk_type = _TYPE_MAP.get(nd.get("type", "section"), ChunkType.SECTION)
+            nodes[nd["id"]] = ChunkNode(
+                id=nd["id"],
+                title=nd["title"],
+                content=nd.get("description", ""),
+                type=chunk_type,
+                status=ChunkStatus.DRAFT,
+                depends_on=nd.get("depends_on", []),
+                dependents=[],
+                round_created=0,
+                round_last_modified=0,
+            )
+
+        rebuild_dependents(nodes)
+        traversal_order = topological_sort(nodes)
+        return {
+            "nodes": nodes,
+            "traversal_order": traversal_order,
+            "global_context": decomp.get("global_context", ""),
+        }

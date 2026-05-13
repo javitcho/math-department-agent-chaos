@@ -315,6 +315,8 @@ function WorkspaceScreen({ sessionId, topic, onNewTopic }) {
           state={state}
           scope={scope}
           scopeChange={scopeChange}
+          nodes={manuscript?.nodes || []}
+          traversalOrder={manuscript?.traversal_order || []}
           running={running}
           stopInfo={stopInfo}
           queuedNote={queuedNote}

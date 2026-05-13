@@ -6,19 +6,18 @@ Reference and Elegance critics do NOT run in scout mode.
 """
 
 import uuid
+import copy
 from datetime import datetime
 from typing import Optional
 
 from config import Config
-import copy
-
 from agents.decomposer import DecomposerAgent
 from agents.rep import RepAgent
 from agents.logic_critic import LogicCriticAgent
 from agents.counterex import CounterexAgent
 from agents.orchestrator import OrchestratorAgent
-from models.document import Chunk, Manuscript
-from models.signals import ChunkStatus, SessionMode, StoppingSignal
+from models.document import ChunkNode, Manuscript
+from models.signals import ChunkStatus, ChunkType, SessionMode, StoppingSignal
 from models.state import AgentMemory, RoundState
 from storage.session_store import save_session
 from storage.memory_store import load_memory, save_memory, append_memory_entry
@@ -40,7 +39,6 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None, scop
     if session_id is None:
         session_id = str(uuid.uuid4())[:8]
 
-    # Use tighter scout-specific token budgets
     config = copy.copy(config)
     config.max_tokens_rep          = config.scout_max_tokens_rep
     config.max_tokens_logic        = config.scout_max_tokens_logic
@@ -50,7 +48,7 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None, scop
     display_info(f"[Scout] Starting session {session_id} — topic: {topic}")
 
     # ------------------------------------------------------------------
-    # Step 1: Decompose the topic
+    # Step 1: Decompose
     # ------------------------------------------------------------------
     decomposer = DecomposerAgent(config)
     display_info("[Scout] Running decomposer...")
@@ -60,76 +58,74 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None, scop
     except Exception as e:
         display_warning(f"Decomposer failed: {e}")
         decomp = {
-            "core_claim": topic,
-            "chunks": [{"id": "main_claim", "title": "Main Claim", "description": topic}],
+            "title": topic,
+            "nodes": [{"id": "main_claim", "title": "Main Claim",
+                        "type": "section", "description": topic, "depends_on": []}],
+            "global_context": "",
             "scout_priority": "main_claim",
-            "key_definitions": [],
-            "lemmas_needed": [],
-            "proof_strategy": "",
-            "expected_connections": [],
         }
 
     # ------------------------------------------------------------------
-    # Step 2: Build initial manuscript from decomposition
+    # Step 2: Build graph and pick scout priority node
     # ------------------------------------------------------------------
-    chunks_data = decomp.get("chunks", [{"id": "main_claim", "title": "Main Claim", "description": topic}])
-    scout_priority = decomp.get("scout_priority", chunks_data[0]["id"] if chunks_data else "main_claim")
+    try:
+        graph = decomposer.build_nodes(decomp)
+        nodes = graph["nodes"]
+        traversal_order = graph["traversal_order"]
+        global_context = graph["global_context"]
+    except Exception as e:
+        display_warning(f"Graph build failed: {e}")
+        fallback_id = "main_claim"
+        fallback_node = ChunkNode(
+            id=fallback_id, title="Main Claim", content=topic,
+            type=ChunkType.SECTION, status=ChunkStatus.DRAFT,
+            depends_on=[], dependents=[], round_created=0, round_last_modified=0,
+        )
+        nodes = {fallback_id: fallback_node}
+        traversal_order = [fallback_id]
+        global_context = ""
 
-    # Create Chunk objects
-    all_chunks = []
-    for cd in chunks_data:
-        all_chunks.append(Chunk(
-            id=cd["id"],
-            title=cd["title"],
-            content=cd.get("description", ""),
-            status=ChunkStatus.DRAFT,
-            round_created=0,
-            round_last_modified=0,
-            flags=[],
-            approved_by_rounds=0,
-        ))
+    scout_priority = decomp.get("scout_priority", traversal_order[0] if traversal_order else "main_claim")
+    if scout_priority not in nodes:
+        scout_priority = traversal_order[0] if traversal_order else list(nodes.keys())[0]
 
-    # Find the scout priority chunk
-    focus_chunk = next((c for c in all_chunks if c.id == scout_priority), all_chunks[0])
+    focus_node = nodes[scout_priority]
+    focus_node.status = ChunkStatus.UNDER_REVIEW
 
     manuscript = Manuscript(
         topic=topic,
         mode=SessionMode.SCOUT,
-        chunks=all_chunks,
-        current_chunk_id=focus_chunk.id,
-        global_context="",
+        nodes=nodes,
+        traversal_order=traversal_order,
+        current_chunk_id=scout_priority,
+        global_context=global_context,
         session_id=session_id,
         created_at=datetime.now(),
         scope=scope,
     )
 
     # ------------------------------------------------------------------
-    # Step 3: Build initial RoundState
+    # Step 3: Build RoundState
     # ------------------------------------------------------------------
-    established = []
-    if decomp.get("core_claim"):
-        established.append(f"Core claim: {decomp['core_claim']}")
-    for defn in decomp.get("key_definitions", [])[:3]:
-        established.append(f"Definition: {defn}")
-
     state = RoundState(
         round=1,
         mode=SessionMode.SCOUT,
-        established=established,
-        current_chunk_id=focus_chunk.id,
-        current_chunk_title=focus_chunk.title,
-        focus_text=focus_chunk.content,
+        established=[f"Core claim: {decomp.get('title', topic)}"],
+        current_chunk_id=scout_priority,
+        current_chunk_title=focus_node.title,
+        focus_text=focus_node.content,
         open_flags=[],
-        round_goal=f"Scout: evaluate the core claim — '{decomp.get('core_claim', topic)}'",
+        round_goal=f"Scout: evaluate the core claim — '{decomp.get('title', topic)}'",
         directive_for_rep="Write a first draft of this chunk. Be concise and mathematically precise.",
         scope=scope,
     )
 
-    # Initialize memories
     memories = {
         agent_id: AgentMemory(agent_id=agent_id, session_id=session_id, entries=[])
         for agent_id in ["rep", "logic_critic", "counterex", "orchestrator", "decomposer"]
     }
+
+    ms_extra = {"manuscript": manuscript}
 
     # ------------------------------------------------------------------
     # Step 4: Rep
@@ -138,21 +134,19 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None, scop
     display_info("[Scout] Running Rep...")
 
     try:
-        rep_output = rep_agent.call(state, memories["rep"])
-        # Scout is always a first draft — always FULL format
-        chunk_content, _ = rep_agent.apply_rep_output(rep_output, focus_chunk.content or "")
-        focus_chunk.content = chunk_content
-        focus_chunk.status = ChunkStatus.UNDER_REVIEW
-        focus_chunk.round_last_modified = 1
+        rep_output = rep_agent.call(state, memories["rep"], extra=ms_extra)
+        chunk_content, _ = rep_agent.apply_rep_output(rep_output, focus_node.content or "")
+        focus_node.content = chunk_content
+        focus_node.status = ChunkStatus.UNDER_REVIEW
+        focus_node.round_last_modified = 1
         state.focus_text = chunk_content
-        # Update memory
         mem_note = rep_agent.extract_memory_note(rep_output)
-        memories["rep"] = append_memory_entry("rep", session_id, 1, focus_chunk.id, mem_note or "Initial draft written")
+        memories["rep"] = append_memory_entry("rep", session_id, 1, scout_priority,
+                                               mem_note or "Initial draft written")
     except Exception as e:
         display_warning(f"Rep failed: {e}")
         rep_output = f"error — skipped: {e}"
 
-    # Save after rep
     save_session(manuscript, state, memories)
 
     # ------------------------------------------------------------------
@@ -162,16 +156,15 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None, scop
     display_info("[Scout] Running Logic Critic...")
 
     try:
-        logic_flags = logic_agent.call(state, memories["logic_critic"])
+        logic_flags = logic_agent.call(state, memories["logic_critic"], extra=ms_extra)
         memories["logic_critic"] = append_memory_entry(
-            "logic_critic", session_id, 1, focus_chunk.id,
+            "logic_critic", session_id, 1, scout_priority,
             f"Scout round: {logic_flags[:80]}"
         )
     except Exception as e:
         display_warning(f"Logic Critic failed: {e}")
         logic_flags = f"error — skipped: {e}"
 
-    # Save after logic critic
     save_session(manuscript, state, memories)
 
     # ------------------------------------------------------------------
@@ -181,20 +174,19 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None, scop
     display_info("[Scout] Running Counterexample Hunter...")
 
     try:
-        counterex_result = counterex_agent.call(state, memories["counterex"])
+        counterex_result = counterex_agent.call(state, memories["counterex"], extra=ms_extra)
         memories["counterex"] = append_memory_entry(
-            "counterex", session_id, 1, focus_chunk.id,
+            "counterex", session_id, 1, scout_priority,
             f"Scout: {counterex_result[:80]}"
         )
     except Exception as e:
         display_warning(f"Counterex Hunter failed: {e}")
         counterex_result = f"error — skipped: {e}"
 
-    # Save after counterex
     save_session(manuscript, state, memories)
 
     # ------------------------------------------------------------------
-    # Step 7: Orchestrator (scout mode — produces verdict)
+    # Step 7: Orchestrator (scout verdict)
     # ------------------------------------------------------------------
     orch_agent = OrchestratorAgent(config)
     display_info("[Scout] Running Orchestrator (scout verdict)...")
@@ -212,7 +204,7 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None, scop
         )
         mem_note = orch_output.get("memory_note", "")
         memories["orchestrator"] = append_memory_entry(
-            "orchestrator", session_id, 1, focus_chunk.id,
+            "orchestrator", session_id, 1, scout_priority,
             mem_note or f"Scout verdict: {orch_output.get('scout_verdict', '?')}"
         )
     except Exception as e:
@@ -224,10 +216,11 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None, scop
             "scout_reason": "Could not evaluate — orchestrator error.",
             "directive_for_rep": "",
             "advance_chunk": False,
+            "modify_dependency": None,
             "memory_note": "",
         }
 
-    # Derive flags from critics (not from orchestrator)
+    # Derive flags from critics
     logic_ok = "ok" in logic_flags.lower() and "error" not in logic_flags.lower()
     no_counterex = "COUNTEREXAMPLE FOUND" not in counterex_result.upper()
     if logic_ok and no_counterex:
@@ -238,24 +231,21 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None, scop
         if not no_counterex:
             new_flags = ["COUNTEREXAMPLE: " + counterex_result[:120]] + new_flags[:4]
 
-    # Inject display fields back into orch_output (display.py expects these)
     orch_output["open_flags"] = new_flags
     orch_output["round_goal"] = state.round_goal
 
-    # Update state with orchestrator output
     state.stopping_signal = orch_output.get("stopping_signal", StoppingSignal.SCOUT_INTERESTING)
     state.stopping_reason = orch_output.get("stopping_reason", "")
     state.open_flags = new_flags
     state.scout_verdict = orch_output.get("scout_verdict")
 
-    # Update chunk flags
-    focus_chunk.flags = new_flags
+    from models.document import ChunkFlag
+    focus_node.flags = [ChunkFlag(source_agent="critics", round=1, text=t) for t in new_flags]
 
-    # Save final scout state
     save_session(manuscript, state, memories)
 
     # ------------------------------------------------------------------
-    # Step 8: Display results
+    # Step 8: Display
     # ------------------------------------------------------------------
     display_scout_result(
         topic=topic,
@@ -267,10 +257,9 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None, scop
     )
 
     # ------------------------------------------------------------------
-    # Step 9: Return result dict
+    # Step 9: Return
     # ------------------------------------------------------------------
     verdict = orch_output.get("scout_verdict", "INTERESTING")
-    # Map scout verdict to stopping signal
     signal_map = {
         "PURSUE": StoppingSignal.SCOUT_PURSUE,
         "DROP": StoppingSignal.SCOUT_DROP,

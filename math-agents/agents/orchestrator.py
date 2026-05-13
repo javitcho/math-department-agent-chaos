@@ -86,7 +86,8 @@ class OrchestratorAgent(BaseAgent):
             '  "directive_for_rep": "two sentences max — specific, collegial; cite the LaTeX label to fix",\n'
             '  "stopping_signal": "continue | serendipity | counterexample | converged | elegant | incubate | budget",\n'
             '  "stopping_reason": "one sentence",\n'
-            '  "advance_chunk": true | false\n'
+            '  "advance_chunk": true | false,\n'
+            '  "modify_dependency": "chunk_id to redirect the Rep to fix instead, or null"\n'
             "}\n"
             "\n"
             "DECISION RULES:\n"
@@ -97,6 +98,18 @@ class OrchestratorAgent(BaseAgent):
             '- INCUBATE: same flags for 3+ consecutive rounds, no progress → "incubate"\n'
             "- ADVANCE_CHUNK: true if this chunk should be considered done after this round\n"
             '- CONTINUE: default when more work is needed\n'
+            "\n"
+            "GRAPH AWARENESS:\n"
+            "You are working on a dependency graph, not a linear document.\n"
+            "The focus chunk may have dependents that will need re-review if it changes.\n"
+            "If you direct the Rep to change a definition or lemma, state explicitly in\n"
+            "your directive: 'note: this change will trigger re-review of [dependent chunk titles].'\n"
+            "The system handles propagation automatically — you just need to flag it.\n"
+            "modify_dependency: if the real fix belongs in a dependency chunk (not the focus chunk),\n"
+            "set this to that dependency's id. The loop will redirect the Rep there and re-queue the\n"
+            "current chunk after the dependency is approved. Set null if fixing focus chunk directly.\n"
+            "When advance_chunk=true and the chunk type is definition or lemma, be aware that all\n"
+            "dependent chunks will be automatically flagged for re-review.\n"
             "\n"
             "SCOUT MODE: when indicated, add two extra fields to the JSON:\n"
             '  "scout_verdict": "PURSUE | DROP | INTERESTING"\n'
@@ -173,6 +186,7 @@ class OrchestratorAgent(BaseAgent):
             data.setdefault("directive_for_rep", "Continue improving the chunk.")
             data.setdefault("stopping_reason", "")
             data.setdefault("advance_chunk", False)
+            data.setdefault("modify_dependency", None)
             data.setdefault("memory_note", "")
             data.setdefault("scout_verdict", None)
             data.setdefault("scout_reason", "")
@@ -190,6 +204,7 @@ class OrchestratorAgent(BaseAgent):
             "stopping_signal": StoppingSignal.CONTINUE,
             "stopping_reason": "Partial parse — output truncated",
             "advance_chunk": False,
+            "modify_dependency": None,
             "memory_note": "",
             "scout_verdict": None,
             "scout_reason": "",

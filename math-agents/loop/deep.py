@@ -19,13 +19,16 @@ from agents.counterex import CounterexAgent
 from agents.reference import ReferenceAgent
 from agents.elegance import EleganceAgent
 from agents.orchestrator import OrchestratorAgent
-from models.document import Chunk, Manuscript
+from models.document import (
+    ChunkNode, Manuscript, propagate_change, rebuild_dependents, topological_sort,
+)
 from models.signals import ChunkStatus, SessionMode, StoppingSignal
 from models.state import AgentMemory, MemoryEntry, RoundState
 from storage.session_store import save_session
 from storage.memory_store import load_memory, save_memory, append_memory_entry
 from output.display import (
     display_round,
+    display_graph_status,
     display_info,
     display_warning,
     display_success,
@@ -39,14 +42,6 @@ from output.display import (
 # ---------------------------------------------------------------------------
 
 class UserInputHandler:
-    """
-    Listens for user commands in a background thread:
-      n <note>  — queue a note for the next round
-      s         — stop after current agent
-      skip      — skip current chunk
-      q         — quit immediately
-    """
-
     def __init__(self):
         self._note_queue: List[str] = []
         self._stop_flag = False
@@ -66,8 +61,7 @@ class UserInputHandler:
     def _listen(self):
         while self._active:
             try:
-                line = input()
-                line = line.strip()
+                line = input().strip()
                 if line.lower() == "q":
                     self._quit_flag = True
                 elif line.lower() == "s":
@@ -95,7 +89,7 @@ class UserInputHandler:
     @property
     def should_skip(self) -> bool:
         val = self._skip_flag
-        self._skip_flag = False   # reset after reading
+        self._skip_flag = False
         return val
 
     @property
@@ -104,6 +98,60 @@ class UserInputHandler:
 
     def reset_stop(self):
         self._stop_flag = False
+
+
+# ---------------------------------------------------------------------------
+# Graph traversal helpers
+# ---------------------------------------------------------------------------
+
+def next_chunk_to_process(manuscript: Manuscript) -> Optional[str]:
+    """
+    Walk traversal_order in order.
+    Return the first chunk that is not APPROVED (or is review_requested).
+    Return None if all are APPROVED and no review_requested.
+    """
+    for nid in manuscript.traversal_order:
+        node = manuscript.nodes.get(nid)
+        if node is None:
+            continue
+        if node.review_requested:
+            return nid
+        if node.status not in (ChunkStatus.APPROVED, ChunkStatus.ABANDONED):
+            return nid
+    return None
+
+
+def after_chunk_approved(manuscript: Manuscript, chunk_id: str) -> List[str]:
+    """
+    Mark chunk as APPROVED and propagate change to dependents.
+    Returns list of dependent ids flagged for re-review.
+    """
+    node = manuscript.nodes.get(chunk_id)
+    if node:
+        node.status = ChunkStatus.APPROVED
+        node.review_requested = False
+
+    flagged = propagate_change(manuscript.nodes, chunk_id)
+
+    manuscript.traversal_order = topological_sort(manuscript.nodes)
+    nxt = next_chunk_to_process(manuscript)
+    if nxt:
+        manuscript.current_chunk_id = nxt
+    return flagged
+
+
+def after_chunk_modified(manuscript: Manuscript, chunk_id: str) -> List[str]:
+    """
+    Called when Rep modifies an already-APPROVED chunk (directed by orchestrator).
+    Sets it back to UNDER_REVIEW and propagates change.
+    Returns list of dependent ids flagged for re-review.
+    """
+    node = manuscript.nodes.get(chunk_id)
+    if node and node.status == ChunkStatus.APPROVED:
+        node.status = ChunkStatus.UNDER_REVIEW
+
+    flagged = propagate_change(manuscript.nodes, chunk_id)
+    return flagged
 
 
 # ---------------------------------------------------------------------------
@@ -121,18 +169,9 @@ def run_deep(
     injected_note: Optional[str] = None,
     scope=None,
 ) -> dict:
-    """
-    Run deep mode on a topic.
-
-    Can start fresh or continue from a prior scout/session.
-    Returns a dict with the final manuscript and session info.
-    """
     if session_id is None:
         session_id = str(uuid.uuid4())[:8]
 
-    # ------------------------------------------------------------------
-    # Build or resume manuscript
-    # ------------------------------------------------------------------
     if existing_manuscript is not None:
         manuscript = existing_manuscript
         state = existing_state
@@ -145,12 +184,8 @@ def run_deep(
         manuscript, state, memories = _build_fresh(topic, session_id, config, scope=scope)
         display_info(f"[Deep] Starting fresh deep session — {session_id}")
 
-    # Inject note if provided
     pending_note: Optional[str] = injected_note
 
-    # ------------------------------------------------------------------
-    # Set up agents
-    # ------------------------------------------------------------------
     rep_agent = RepAgent(config)
     logic_agent = LogicCriticAgent(config)
     counterex_agent = CounterexAgent(config)
@@ -158,46 +193,35 @@ def run_deep(
     elegance_agent = EleganceAgent(config)
     orch_agent = OrchestratorAgent(config)
 
-    # ------------------------------------------------------------------
-    # Set up user input handler
-    # ------------------------------------------------------------------
     input_handler = UserInputHandler()
     input_handler.start()
 
-    # Track consecutive clean rounds per chunk for convergence
     chunk_consecutive_clean: Dict[str, int] = {}
     chunk_flag_history: Dict[str, List[List[str]]] = {}
 
-    # ------------------------------------------------------------------
-    # Outer loop: iterate over chunks
-    # ------------------------------------------------------------------
-    chunk_idx = 0
+    chunks_processed = 0
+
     try:
-        while chunk_idx < len(manuscript.chunks) and chunk_idx < config.max_chunks_per_session:
-            chunk = manuscript.chunks[chunk_idx]
+        while chunks_processed < config.max_chunks_per_session:
+            chunk_id = next_chunk_to_process(manuscript)
+            if chunk_id is None:
+                display_success("[Deep] All chunks approved. Session complete.")
+                break
 
-            if chunk.status == ChunkStatus.APPROVED:
-                display_info(f"[Deep] Skipping approved chunk: {chunk.id}")
-                chunk_idx += 1
-                continue
+            chunk = manuscript.nodes[chunk_id]
+            manuscript.current_chunk_id = chunk_id
 
-            if chunk.status == ChunkStatus.ABANDONED:
-                display_info(f"[Deep] Skipping abandoned chunk: {chunk.id}")
-                chunk_idx += 1
-                continue
+            if chunk.status not in (ChunkStatus.APPROVED, ChunkStatus.ABANDONED):
+                chunk.status = ChunkStatus.UNDER_REVIEW
+            chunk.review_requested = False
 
-            manuscript.current_chunk_id = chunk.id
-            chunk.status = ChunkStatus.UNDER_REVIEW
+            display_graph_status(manuscript)
 
-            # Initialize convergence tracking for this chunk
-            chunk_consecutive_clean.setdefault(chunk.id, 0)
-            chunk_flag_history.setdefault(chunk.id, [])
-            prev_round_logic_ok = True   # elegance gating across rounds
-            force_full_next = False      # rep diff fallback
+            chunk_consecutive_clean.setdefault(chunk_id, 0)
+            chunk_flag_history.setdefault(chunk_id, [])
+            prev_round_logic_ok = True
+            force_full_next = False
 
-            # ----------------------------------------------------------------
-            # Inner loop: rounds per chunk
-            # ----------------------------------------------------------------
             round_num = 0
             while round_num < config.max_rounds_per_chunk:
                 if input_handler.should_quit:
@@ -207,31 +231,41 @@ def run_deep(
                     return _make_result(manuscript, session_id, memories, "user_quit")
 
                 if input_handler.should_skip:
-                    display_info(f"[Deep] Skipping chunk {chunk.id}.")
+                    display_info(f"[Deep] Skipping chunk {chunk_id}.")
                     chunk.status = ChunkStatus.ABANDONED
                     break
 
-                # Pop user note
                 user_note = pending_note or input_handler.pop_note()
                 pending_note = None
 
-                # ---- Build state
                 state = _build_round_state(manuscript, chunk, round_num, state, user_note)
 
-                display_info(f"[Deep] Round {round_num + 1} — chunk: {chunk.id}")
+                display_info(f"[Deep] Round {round_num + 1} — chunk: {chunk_id}")
 
-                # ---- Rep (diff format; FULL if first draft or fallback requested)
-                rep_extra = {}
+                # Pass manuscript in extra so agents get dependency-precise context
+                ms_extra = {"manuscript": manuscript}
+
+                # ---- Rep
+                rep_extra = {**ms_extra}
                 if force_full_next:
                     rep_extra["force_full"] = True
                     force_full_next = False
-                rep_output = _safe_call(rep_agent, "rep", state, memories, session_id, round_num, chunk.id,
+                rep_output = _safe_call(rep_agent, "rep", state, memories, session_id, round_num, chunk_id,
                                         extra=rep_extra)
                 new_content, force_full_next = rep_agent.apply_rep_output(rep_output, chunk.content or "")
+
+                # If Rep changed an APPROVED chunk (dependency redirect), mark it modified
+                was_approved = chunk.status == ChunkStatus.APPROVED
                 chunk.content = new_content
                 chunk.round_last_modified = round_num + 1
                 state.focus_text = new_content
-                _extract_and_store_memory(rep_agent, rep_output, "MEMORY NOTE", memories, "rep", session_id, round_num + 1, chunk.id, config)
+                if was_approved and new_content != (chunk.content or ""):
+                    flagged = after_chunk_modified(manuscript, chunk_id)
+                    if flagged:
+                        display_info(f"[Deep] Dependency change in {chunk_id} — flagged for re-review: {flagged}")
+
+                _extract_and_store_memory(rep_agent, rep_output, "MEMORY NOTE", memories, "rep",
+                                          session_id, round_num + 1, chunk_id, config)
                 save_session(manuscript, state, memories)
 
                 if input_handler.should_stop:
@@ -241,19 +275,25 @@ def run_deep(
                     continue
 
                 # ---- Logic Critic
-                logic_flags = _safe_call(logic_agent, "logic_critic", state, memories, session_id, round_num, chunk.id)
-                _extract_and_store_memory(logic_agent, logic_flags, "MEMORY NOTE", memories, "logic_critic", session_id, round_num + 1, chunk.id, config)
+                logic_flags = _safe_call(logic_agent, "logic_critic", state, memories, session_id,
+                                         round_num, chunk_id, extra=ms_extra)
+                _extract_and_store_memory(logic_agent, logic_flags, "MEMORY NOTE", memories, "logic_critic",
+                                          session_id, round_num + 1, chunk_id, config)
                 save_session(manuscript, state, memories)
 
                 # ---- Counterex
-                counterex_result = _safe_call(counterex_agent, "counterex", state, memories, session_id, round_num, chunk.id)
-                _extract_and_store_memory(counterex_agent, counterex_result, "MEMORY NOTE", memories, "counterex", session_id, round_num + 1, chunk.id, config)
+                counterex_result = _safe_call(counterex_agent, "counterex", state, memories, session_id,
+                                              round_num, chunk_id, extra=ms_extra)
+                _extract_and_store_memory(counterex_agent, counterex_result, "MEMORY NOTE", memories, "counterex",
+                                          session_id, round_num + 1, chunk_id, config)
                 save_session(manuscript, state, memories)
 
-                # ---- Reference (opt-in, specific rounds only)
+                # ---- Reference (opt-in)
                 if config.reference_critic_enabled and (round_num + 1) in config.reference_critic_rounds:
-                    ref_notes = _safe_call(reference_agent, "reference", state, memories, session_id, round_num, chunk.id)
-                    _extract_and_store_memory(reference_agent, ref_notes, "MEMORY NOTE", memories, "reference", session_id, round_num + 1, chunk.id, config)
+                    ref_notes = _safe_call(reference_agent, "reference", state, memories, session_id,
+                                           round_num, chunk_id, extra=ms_extra)
+                    _extract_and_store_memory(reference_agent, ref_notes, "MEMORY NOTE", memories, "reference",
+                                              session_id, round_num + 1, chunk_id, config)
                     save_session(manuscript, state, memories)
                 else:
                     ref_notes = "(not run)"
@@ -261,14 +301,15 @@ def run_deep(
                 # ---- Elegance (every other round; only if logic was clean last round)
                 elegance_should_run = (round_num % 2 == 0) and (round_num == 0 or prev_round_logic_ok)
                 if elegance_should_run:
-                    elegance_notes = _safe_call(elegance_agent, "elegance", state, memories, session_id, round_num, chunk.id)
-                    _extract_and_store_memory(elegance_agent, elegance_notes, "MEMORY NOTE", memories, "elegance", session_id, round_num + 1, chunk.id, config)
+                    elegance_notes = _safe_call(elegance_agent, "elegance", state, memories, session_id,
+                                                round_num, chunk_id, extra=ms_extra)
+                    _extract_and_store_memory(elegance_agent, elegance_notes, "MEMORY NOTE", memories, "elegance",
+                                              session_id, round_num + 1, chunk_id, config)
                     save_session(manuscript, state, memories)
                 else:
                     elegance_notes = "(skipped)"
 
-                # ---- Orchestrator
-                # ---- Derive flags from critics (not from orchestrator)
+                # ---- Derive flags from critics
                 logic_ok = "ok" in logic_flags.lower() and "error" not in logic_flags.lower()
                 no_counterex = "COUNTEREXAMPLE FOUND" not in counterex_result.upper()
                 if logic_ok and no_counterex:
@@ -297,7 +338,7 @@ def run_deep(
                         scout_mode=False,
                     )
                     memories["orchestrator"] = append_memory_entry(
-                        "orchestrator", session_id, round_num + 1, chunk.id,
+                        "orchestrator", session_id, round_num + 1, chunk_id,
                         orch_output.get("memory_note") or f"Round {round_num + 1} complete",
                         config.max_memory_entries, config.memory_compress_to,
                     )
@@ -305,29 +346,39 @@ def run_deep(
                     display_warning(f"Orchestrator failed: {e}")
                     orch_output = _fallback_orch_output(state, str(e))
 
-                # Inject derived fields into orch_output dict for display
+                # Inject display fields
                 orch_output["open_flags"] = new_flags
                 orch_output["round_goal"] = state.round_goal
 
+                # ---- Handle modify_dependency redirect
+                redirect_id = orch_output.get("modify_dependency")
+                if redirect_id and redirect_id in manuscript.nodes and redirect_id != chunk_id:
+                    display_info(f"[Deep] Orchestrator redirecting Rep to fix dependency: {redirect_id}")
+                    dep_node = manuscript.nodes[redirect_id]
+                    dep_node.status = ChunkStatus.UNDER_REVIEW
+                    dep_node.review_requested = True
+                    # Re-queue current chunk after dependency
+                    chunk.review_requested = True
+                    save_session(manuscript, state, memories)
+                    break
+
                 save_session(manuscript, state, memories)
 
-                # ---- Update state from orchestrator output
                 state = _apply_orch_output(state, orch_output, chunk, new_flags)
-                chunk.flags = new_flags
+                chunk.flags = [f for f in chunk.flags if f.resolved]  # keep resolved; replace unresolved
+                from models.document import ChunkFlag
+                for flag_text in new_flags:
+                    chunk.flags.append(ChunkFlag(source_agent="critics", round=round_num + 1, text=flag_text))
 
-                # ---- Track convergence
-                flag_history = chunk_flag_history[chunk.id]
+                flag_history = chunk_flag_history[chunk_id]
                 flag_history.append(list(new_flags))
-
-                no_new_flags = not new_flags
                 prev_round_logic_ok = logic_ok
 
-                if logic_ok and no_counterex and no_new_flags:
-                    chunk_consecutive_clean[chunk.id] = chunk_consecutive_clean.get(chunk.id, 0) + 1
+                if logic_ok and no_counterex and not new_flags:
+                    chunk_consecutive_clean[chunk_id] = chunk_consecutive_clean.get(chunk_id, 0) + 1
                 else:
-                    chunk_consecutive_clean[chunk.id] = 0
+                    chunk_consecutive_clean[chunk_id] = 0
 
-                # ---- Display round
                 display_round(
                     round_num=round_num + 1,
                     chunk_title=chunk.title,
@@ -340,7 +391,6 @@ def run_deep(
                     mode="deep",
                 )
 
-                # ---- Handle stopping signals
                 signal = orch_output.get("stopping_signal", StoppingSignal.CONTINUE)
 
                 if signal == StoppingSignal.COUNTEREXAMPLE:
@@ -354,21 +404,18 @@ def run_deep(
                     display_info("[Deep] SERENDIPITY — pausing for user decision.")
                     try:
                         answer = input("Continue? [y/n]: ").strip().lower()
-                    except EOFError:
-                        answer = "y"
-                    except KeyboardInterrupt:
+                    except (EOFError, KeyboardInterrupt):
                         answer = "n"
                     if answer != "y":
                         save_session(manuscript, state, memories)
                         input_handler.stop()
                         return _make_result(manuscript, session_id, memories, "serendipity")
-                    # Continue if user says yes
 
                 if signal in (StoppingSignal.CONVERGED, StoppingSignal.ELEGANT):
-                    chunk.status = ChunkStatus.APPROVED
-                    chunk.approved_by_rounds = round_num + 1
-                    _update_global_context(manuscript)
-                    display_success(f"[Deep] Chunk {chunk.id} APPROVED — signal: {signal.value}")
+                    flagged = after_chunk_approved(manuscript, chunk_id)
+                    if flagged:
+                        display_info(f"[Deep] Chunk {chunk_id} approved — flagged dependents for re-review: {flagged}")
+                    display_success(f"[Deep] Chunk {chunk_id} APPROVED — signal: {signal.value}")
                     save_session(manuscript, state, memories)
                     break
 
@@ -378,35 +425,36 @@ def run_deep(
                     input_handler.stop()
                     return _make_result(manuscript, session_id, memories, "incubate")
 
-                # ---- Check convergence (independent of orchestrator signal)
-                if chunk_consecutive_clean.get(chunk.id, 0) >= config.convergence_rounds:
-                    chunk.status = ChunkStatus.APPROVED
-                    chunk.approved_by_rounds = round_num + 1
-                    _update_global_context(manuscript)
-                    display_success(f"[Deep] Chunk {chunk.id} CONVERGED after {round_num + 1} rounds.")
+                if chunk_consecutive_clean.get(chunk_id, 0) >= config.convergence_rounds:
+                    flagged = after_chunk_approved(manuscript, chunk_id)
+                    if flagged:
+                        display_info(f"[Deep] Chunk {chunk_id} converged — flagged dependents: {flagged}")
+                    display_success(f"[Deep] Chunk {chunk_id} CONVERGED after {round_num + 1} rounds.")
                     save_session(manuscript, state, memories)
                     break
 
-                # ---- Check incubation (stuck for N rounds)
                 if len(flag_history) >= config.incubation_rounds:
                     recent = flag_history[-config.incubation_rounds:]
                     if all(set(f) == set(recent[0]) for f in recent) and recent[0]:
-                        display_info(f"[Deep] INCUBATE — same flags for {config.incubation_rounds} rounds. Pausing.")
+                        display_info(f"[Deep] INCUBATE — same flags for {config.incubation_rounds} rounds.")
                         save_session(manuscript, state, memories)
                         input_handler.stop()
                         return _make_result(manuscript, session_id, memories, "incubate")
 
-                round_num += 1
-
-                # Budget check
-                if round_num >= config.max_rounds_per_chunk:
-                    display_info(f"[Deep] Budget reached for chunk {chunk.id}.")
+                if orch_output.get("advance_chunk"):
+                    flagged = after_chunk_approved(manuscript, chunk_id)
+                    if flagged:
+                        display_info(f"[Deep] advance_chunk — flagged dependents: {flagged}")
+                    save_session(manuscript, state, memories)
                     break
 
-            # End of inner loop for this chunk
-            chunk_idx += 1
-            if orch_output.get("advance_chunk") and chunk_idx < len(manuscript.chunks):
-                manuscript.current_chunk_id = manuscript.chunks[chunk_idx].id
+                round_num += 1
+
+                if round_num >= config.max_rounds_per_chunk:
+                    display_info(f"[Deep] Budget reached for chunk {chunk_id}.")
+                    break
+
+            chunks_processed += 1
 
     except KeyboardInterrupt:
         display_info("[Deep] Interrupted. Saving session.")
@@ -415,7 +463,6 @@ def run_deep(
     finally:
         input_handler.stop()
 
-    # Final save
     save_session(manuscript, state, memories)
     display_success(f"[Deep] Session complete. ID: {session_id}")
     return _make_result(manuscript, session_id, memories, "complete")
@@ -428,7 +475,6 @@ def run_deep(
 def _safe_call(agent, agent_id: str, state: RoundState, memories: dict,
                session_id: str, round_num: int, chunk_id: str,
                extra: dict = None) -> str:
-    """Call an agent safely, returning a graceful error string on failure."""
     try:
         return agent.call(state, memories.get(agent_id, AgentMemory(agent_id, session_id)),
                           extra=extra or {})
@@ -442,13 +488,11 @@ def _extract_and_store_memory(
     agent, output: str, marker: str, memories: dict,
     agent_id: str, session_id: str, round_num: int, chunk_id: str, config: Config
 ) -> None:
-    """Extract MEMORY NOTE from agent output and persist it."""
     note = ""
     if marker in output:
         try:
             start = output.index(marker) + len(marker)
             note = output[start:].strip().lstrip(":").strip()
-            # Truncate to first line
             note = note.splitlines()[0][:120] if note else ""
         except (ValueError, IndexError):
             pass
@@ -462,16 +506,16 @@ def _extract_and_store_memory(
 
 def _build_round_state(
     manuscript: Manuscript,
-    chunk: Chunk,
+    chunk: ChunkNode,
     round_num: int,
     prev_state: Optional[RoundState],
     user_note: Optional[str] = None,
 ) -> RoundState:
-    """Build a RoundState for the given chunk and round."""
     established = prev_state.established if prev_state else []
-    open_flags = chunk.flags or (prev_state.open_flags if prev_state else [])
+    unresolved_flags = [f.text for f in chunk.flags if not f.resolved]
+    open_flags = unresolved_flags or (prev_state.open_flags if prev_state else [])
 
-    goal = f"Develop chunk '{chunk.title}', round {round_num + 1}"
+    goal = f"Develop chunk '{chunk.title}' ({chunk.type.value}), round {round_num + 1}"
     if open_flags:
         goal = f"Resolve open flags in '{chunk.title}': {'; '.join(open_flags[:2])}"
 
@@ -497,9 +541,8 @@ def _build_round_state(
     )
 
 
-def _apply_orch_output(state: RoundState, orch_output: dict, chunk: Chunk,
+def _apply_orch_output(state: RoundState, orch_output: dict, chunk: ChunkNode,
                        new_flags: list) -> RoundState:
-    """Update state with orchestrator output. Flags/established derived from session state."""
     signal = orch_output.get("stopping_signal", StoppingSignal.CONTINUE)
     if not isinstance(signal, StoppingSignal):
         signal = StoppingSignal.CONTINUE
@@ -509,19 +552,7 @@ def _apply_orch_output(state: RoundState, orch_output: dict, chunk: Chunk,
     state.directive_for_rep = orch_output.get("directive_for_rep", state.directive_for_rep)
     state.open_flags = new_flags
     state.priority_issues = new_flags[:3]
-    # round_goal and established preserved from _build_round_state
     return state
-
-
-def _update_global_context(manuscript: Manuscript) -> None:
-    """Compress approved chunks into global_context bullets."""
-    bullets = []
-    for chunk in manuscript.chunks:
-        if chunk.status == ChunkStatus.APPROVED and chunk.content:
-            # Extract first sentence as summary
-            first_line = chunk.content.strip().splitlines()[0][:100]
-            bullets.append(f"• [{chunk.id}] {chunk.title}: {first_line}")
-    manuscript.global_context = "\n".join(bullets)
 
 
 def _build_fresh(topic: str, session_id: str, config: Config, scope=None):
@@ -534,46 +565,38 @@ def _build_fresh(topic: str, session_id: str, config: Config, scope=None):
     except Exception as e:
         display_warning(f"Decomposer failed: {e}")
         decomp = {
-            "core_claim": topic,
-            "chunks": [{"id": "main_claim", "title": "Main Claim", "description": topic}],
+            "title": topic,
+            "nodes": [{"id": "main_claim", "title": "Main Claim",
+                        "type": "section", "description": topic, "depends_on": []}],
+            "global_context": "",
             "scout_priority": "main_claim",
-            "key_definitions": [],
         }
 
-    chunks_data = decomp.get("chunks", [{"id": "main_claim", "title": "Main Claim", "description": topic}])
-    all_chunks = [
-        Chunk(
-            id=cd["id"],
-            title=cd["title"],
-            content=cd.get("description", ""),
-            status=ChunkStatus.DRAFT,
-            round_created=0,
-            round_last_modified=0,
-        )
-        for cd in chunks_data
-    ]
+    graph = decomposer.build_nodes(decomp)
+    nodes = graph["nodes"]
+    traversal_order = graph["traversal_order"]
+    global_context = graph["global_context"]
+
+    first_id = traversal_order[0] if traversal_order else "main_claim"
 
     manuscript = Manuscript(
         topic=topic,
         mode=SessionMode.DEEP,
-        chunks=all_chunks,
-        current_chunk_id=all_chunks[0].id if all_chunks else "chunk_1",
-        global_context="",
+        nodes=nodes,
+        traversal_order=traversal_order,
+        current_chunk_id=first_id,
+        global_context=global_context,
         session_id=session_id,
         created_at=datetime.now(),
         scope=scope,
     )
 
-    established = []
-    if decomp.get("core_claim"):
-        established.append(f"Core claim: {decomp['core_claim']}")
-
     state = RoundState(
         round=0,
         mode=SessionMode.DEEP,
-        established=established,
-        current_chunk_id=manuscript.current_chunk_id,
-        current_chunk_title=all_chunks[0].title if all_chunks else "Main",
+        established=[f"Core claim: {topic}"],
+        current_chunk_id=first_id,
+        current_chunk_title=nodes[first_id].title if first_id in nodes else "Main",
         focus_text="",
         open_flags=[],
         round_goal="Begin deep session",
@@ -591,34 +614,30 @@ def _build_from_scout(prior_scout: dict, session_id: str, config: Config):
     memories = prior_scout.get("memories", {})
 
     if manuscript is None:
-        return _build_fresh(prior_scout.get("decomp", {}).get("core_claim", "topic"), session_id, config)
+        topic = prior_scout.get("decomp", {}).get("title", "topic")
+        return _build_fresh(topic, session_id, config)
 
-    # Switch mode to deep
     manuscript.mode = SessionMode.DEEP
     manuscript.session_id = session_id
 
-    # Reset chunk statuses from scout
-    for chunk in manuscript.chunks:
-        if chunk.status not in (ChunkStatus.APPROVED,):
-            chunk.status = ChunkStatus.DRAFT
+    for node in manuscript.nodes.values():
+        if node.status not in (ChunkStatus.APPROVED,):
+            node.status = ChunkStatus.DRAFT
 
-    established = []
-    if manuscript.chunks:
-        established.append(f"Core claim: {manuscript.topic}")
+    first_id = manuscript.traversal_order[0] if manuscript.traversal_order else manuscript.current_chunk_id
 
     state = RoundState(
         round=0,
         mode=SessionMode.DEEP,
-        established=established,
-        current_chunk_id=manuscript.current_chunk_id,
-        current_chunk_title=manuscript.chunks[0].title if manuscript.chunks else "Main",
+        established=[f"Core claim: {manuscript.topic}"],
+        current_chunk_id=first_id,
+        current_chunk_title=manuscript.nodes[first_id].title if first_id in manuscript.nodes else "Main",
         focus_text="",
         open_flags=[],
         round_goal="Begin deep session from scout",
         directive_for_rep="Develop the first chunk fully.",
     )
 
-    # Ensure all agent memories exist for this session
     all_agents = ["rep", "logic_critic", "counterex", "reference", "elegance", "orchestrator"]
     for agent_id in all_agents:
         if agent_id not in memories:
@@ -628,7 +647,6 @@ def _build_from_scout(prior_scout: dict, session_id: str, config: Config):
 
 
 def _init_memories(session_id: str) -> Dict[str, AgentMemory]:
-    """Initialize empty memories for all agents."""
     agent_ids = ["rep", "logic_critic", "counterex", "reference", "elegance", "orchestrator"]
     return {
         aid: AgentMemory(agent_id=aid, session_id=session_id, entries=[])
@@ -637,12 +655,12 @@ def _init_memories(session_id: str) -> Dict[str, AgentMemory]:
 
 
 def _fallback_orch_output(state: RoundState, error_msg: str) -> dict:
-    """Return a safe fallback orchestrator output (4-field schema)."""
     return {
         "stopping_signal": StoppingSignal.CONTINUE,
         "stopping_reason": f"Orchestrator error: {error_msg}",
         "directive_for_rep": state.directive_for_rep,
         "advance_chunk": False,
+        "modify_dependency": None,
         "memory_note": "",
         "scout_verdict": None,
         "scout_reason": "",

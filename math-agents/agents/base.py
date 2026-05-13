@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 from anthropic import Anthropic
 
 from config import Config
+from models.document import get_context_for_chunk
 from models.state import AgentMemory, MemoryEntry, RoundState, SessionScope
 from models.signals import StoppingSignal
 from storage.memory_store import load_memory, save_memory
@@ -135,8 +136,64 @@ class BaseAgent:
             lines.append(f"• {round_label} {e.chunk_id}: {e.note}")
         return "\n".join(lines)
 
-    def _serialize_state(self, state: RoundState) -> str:
-        """Serialize a RoundState to a compact text block for inclusion in user messages."""
+    def _build_context(self, manuscript, chunk_id: str) -> str:
+        """
+        Build dependency-precise context for an agent.
+        Focus chunk + direct dependencies (one hop only, truncated to 300 chars each).
+        Never passes the full document.
+        """
+        node = manuscript.nodes.get(chunk_id)
+        if node is None:
+            return f"FOCUS CHUNK: {chunk_id}\n(not found)"
+
+        lines = [f"FOCUS CHUNK ({node.type.value}): {node.title}"]
+        focus = node.content or "[not yet written]"
+        if not self.needs_full_chunk and len(focus) > 800:
+            focus = focus[:800] + "\n[truncated]"
+        lines.append(focus)
+
+        deps = get_context_for_chunk(manuscript.nodes, chunk_id)
+        if deps:
+            lines.append("\nDIRECT DEPENDENCIES:")
+            for dep in deps:
+                dep_text = dep.content[:300] + ("..." if len(dep.content) > 300 else "")
+                lines.append(f"  [{dep.type.value}] {dep.title}: {dep_text}")
+
+        unresolved = [f for f in node.flags if not f.resolved]
+        if unresolved:
+            lines.append("\nUNRESOLVED FLAGS:")
+            for flag in unresolved:
+                lines.append(f"  [{flag.source_agent}] {flag.text}")
+
+        return "\n".join(lines)
+
+    def _serialize_state(self, state: RoundState, extra: dict = None) -> str:
+        """
+        Serialize context for agent user messages.
+        When extra contains a 'manuscript', uses dependency-precise context via _build_context.
+        Falls back to the full RoundState serialization otherwise.
+        """
+        manuscript = (extra or {}).get("manuscript")
+        if manuscript is not None:
+            ctx = self._build_context(manuscript, state.current_chunk_id)
+            lines = [
+                f"ROUND: {state.round}  MODE: {state.mode.value}",
+                f"ROUND GOAL: {state.round_goal}",
+                "",
+                ctx,
+            ]
+            if state.open_flags:
+                lines.append("\nOPEN FLAGS:")
+                for flag in state.open_flags:
+                    lines.append(f"  • {flag}")
+            if state.directive_for_rep:
+                lines.append(f"\nDIRECTIVE FOR REP: {state.directive_for_rep}")
+            if state.scope is not None:
+                lines.append("")
+                lines.append(self.build_scope_context(state.scope))
+            return "\n".join(lines)
+
+        # Legacy path (no manuscript available)
         lines = [
             f"ROUND: {state.round}",
             f"MODE: {state.mode.value}",

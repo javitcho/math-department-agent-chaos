@@ -1,8 +1,8 @@
 # Math Research Multi-Agent System
 
-A Python CLI that models a mathematician's internal research process: rapid idea development
-with simultaneous self-critique across logical validity, prior art, and aesthetic quality.
-Not a proof verifier. Not autonomous. The human is always in the loop.
+A Python CLI (and optional web app) that models a mathematician's internal research process:
+rapid idea development with simultaneous self-critique across logical validity, prior art,
+and aesthetic quality. Not a proof verifier. Not autonomous. The human is always in the loop.
 
 ---
 
@@ -18,32 +18,43 @@ math-department-agent-chaos/
     ├── config.py                ← all tunable parameters
     ├── .env                     ← ANTHROPIC_API_KEY (never commit)
     ├── agents/
-    │   ├── base.py              ← BaseAgent: call_api, skill loader, memory I/O
-    │   ├── orchestrator.py      ← session supervisor; produces RoundState JSON
-    │   ├── decomposer.py        ← one-shot topic → chunk roadmap
-    │   ├── rep.py               ← writes/updates LaTeX chunk content
+    │   ├── base.py              ← BaseAgent: call_api, _build_context, skill loader, memory I/O
+    │   ├── orchestrator.py      ← session supervisor; produces 4-field JSON + modify_dependency
+    │   ├── decomposer.py        ← one-shot topic → dependency graph (nodes + depends_on edges)
+    │   ├── rep.py               ← writes/updates LaTeX node content (diff format after round 1)
     │   ├── logic_critic.py      ← finds logical errors, one line per flag
     │   ├── counterex.py         ← ≤3-step counterexample search
-    │   ├── reference.py         ← prior art + cross-domain connections
-    │   └── elegance.py          ← scores 1-10, flags structural issues
+    │   ├── reference.py         ← prior art + cross-domain connections (opt-in)
+    │   └── elegance.py          ← scores 1-10, flags structural issues (every other round)
     ├── models/
-    │   ├── signals.py           ← ChunkStatus, SessionMode, StoppingSignal enums
-    │   ├── document.py          ← Chunk, Manuscript dataclasses
-    │   └── state.py             ← RoundState, AgentMemory, MemoryEntry
+    │   ├── signals.py           ← ChunkType, ChunkStatus, SessionMode, StoppingSignal enums
+    │   ├── document.py          ← ChunkNode, ChunkFlag, Manuscript; graph utilities
+    │   └── state.py             ← RoundState, AgentMemory, MemoryEntry, SessionScope
     ├── loop/
     │   ├── scout.py             ← one-pass verdict: Decomposer→Rep→Logic→Counterex→Orch
-    │   └── deep.py              ← full loop: chunk-by-chunk, all agents, stopping signals
+    │   └── deep.py              ← graph traversal loop; all agents; stopping signals
     ├── storage/
-    │   ├── session_store.py     ← save/load sessions/{id}/session.json
-    │   └── memory_store.py      ← per-agent memory with compression
+    │   ├── session_store.py     ← save/load sessions/{id}/session.json; save hooks for SSE
+    │   ├── memory_store.py      ← per-agent memory with compression
+    │   └── manuscript_parser.py ← parse .tex/.md files → dependency graph
     ├── output/
-    │   ├── display.py           ← rich terminal panels
+    │   ├── display.py           ← rich terminal panels; display_graph_status()
     │   └── exporter.py          ← manuscript.md + manuscript.tex per round
+    ├── server/                  ← optional FastAPI web app
+    │   ├── app.py               ← REST + SSE endpoints
+    │   └── runner.py            ← background session thread; save hooks → SSE events
+    ├── web/                     ← React frontend (Vite)
+    │   └── src/
+    │       ├── App.jsx          ← main workspace screen
+    │       └── components/
+    │           ├── SupervisorPanel.jsx  ← scope, signals, SVG dependency graph
+    │           ├── ManuscriptPanel.jsx  ← node content panels
+    │           └── AgentFeed.jsx        ← live agent output stream
     ├── skills/                  ← markdown prompt modules loaded by agents at runtime
-    │   ├── orchestrator/        ← chunk_splitter.md, state_builder.md, decision_logic.md
-    │   ├── logic_critic/        ← error_taxonomy.md
-    │   ├── rep/                 ← proof_scaffolder.md (includes LaTeX conventions)
-    │   └── reference/           ← search_strategy.md
+    │   ├── orchestrator/
+    │   ├── logic_critic/
+    │   ├── rep/
+    │   └── reference/
     └── sessions/                ← persisted session state (gitignored)
 ```
 
@@ -51,16 +62,23 @@ math-department-agent-chaos/
 
 ## Running the system
 
-All commands run from `math-agents/`. The `.env` file is already set up.
+### Terminal (CLI)
 
 ```bash
 cd math-agents
+pip install -r requirements.txt   # first time only
 
 # Quick idea filter — one pass, verdict only (~$0.015)
 python main.py --topic "prove that √2 is irrational" --mode scout
 
-# Full development — chunk by chunk, all agents, up to 4 rounds per chunk
+# Full development — dependency graph, all agents, up to 4 rounds per node
 python main.py --topic "prove that √2 is irrational" --mode deep
+
+# Enable the Reference Critic (disabled by default to save tokens)
+python main.py --topic "X" --mode deep --with-references
+
+# Explicit scope overrides
+python main.py --topic "X" --purpose paper --audience graduate --rigor full
 
 # Resume a saved session
 python main.py --session abc123
@@ -76,6 +94,20 @@ python main.py --session abc123 --inspect
 
 # Export to markdown + LaTeX (also runs pdflatex if available)
 python main.py --session abc123 --export
+
+# Start the web app (localhost:5000 backend, localhost:5173 frontend)
+python main.py --serve
+```
+
+### Web app (two terminals)
+
+```bash
+# Terminal 1 — Python backend
+cd math-agents && python main.py --serve
+
+# Terminal 2 — React dev server
+cd math-agents/web && npm install && npm run dev
+# → open http://localhost:5173
 ```
 
 Use the slash commands below in this Claude Code session instead of typing these manually.
@@ -88,6 +120,7 @@ Use the slash commands below in this Claude Code session instead of typing these
 |---|---|
 | `/scout <topic>` | Run scout mode on a topic |
 | `/deep <topic>` | Run deep mode on a topic |
+| `/serve` | Start the web app (backend + instructions for frontend) |
 | `/malist` | List all saved sessions |
 | `/inspect <session-id>` | Inspect a session without running agents |
 | `/resume <session-id>` | Resume a saved session in deep mode |
@@ -101,19 +134,31 @@ Use the slash commands below in this Claude Code session instead of typing these
   apply; also produces readable output one agent at a time.
 - **Session saved after every agent call** — not just end of round. Crash recovery for
   long sessions that are expensive to re-run.
-- **Chunk-based document model** — agents receive one chunk + context, not the full manuscript.
-  Scales linearly with chunk count; full-document passing hits token limits fast.
-- **Rep outputs LaTeX** — AMS environments (`\begin{theorem}`, `\begin{proof}`, etc.) with
-  `\label{thm:name}` on every numbered environment. Label prefixes: `def:`, `thm:`, `lem:`,
-  `cor:`, `rem:`. No document preamble — the exporter adds it.
-- **Orchestrator output is JSON** — the `_extract_partial` fallback salvages truncated output
-  rather than silently discarding it. Partial is better than a blank default.
+- **Dependency graph model** — `Manuscript.nodes: Dict[str, ChunkNode]` keyed by id.
+  `traversal_order` is a topological sort recomputed when the graph changes. Agents receive
+  the focus node plus direct dependencies only (`_build_context`), not the full document.
+- **Graph traversal loop** — `next_chunk_to_process()` walks `traversal_order` and returns
+  the first node that is not APPROVED (or has `review_requested=True`). Approving a node
+  calls `propagate_change()` which sets `review_requested=True` on all transitive dependents.
+- **modify_dependency** — orchestrator can redirect the Rep to fix a dependency chunk instead
+  of the focus chunk. The loop re-queues the current chunk to be processed after the
+  dependency is approved.
+- **Rep outputs diffs** — `DIFF / REPLACE: / WITH: / END DIFF` format after round 1.
+  First draft always uses `FULL / END FULL`. `apply_rep_output()` in `rep.py` handles both.
+- **Orchestrator output is 4-field JSON** — `directive_for_rep`, `stopping_signal`,
+  `stopping_reason`, `advance_chunk` (plus `modify_dependency`). Flags/established/round_goal
+  are derived in the loop from critic outputs, not from the orchestrator model.
 - **Two modes** — Scout (Decomposer → Rep → Logic → Counterex → Orchestrator, ~$0.015)
-  filters ideas; Deep (all six agents, up to 4 rounds × 8 chunks, ~$0.50–$1.50) develops survivors.
+  filters ideas; Deep (all agents, graph traversal, ~$0.50–$1.50) develops survivors.
+- **Reference Critic is opt-in** — `--with-references` flag or `config.reference_critic_enabled`.
+  Disabled by default to save tokens (~30% of input cost when active).
+- **Elegance runs every other round** — and only when logic was clean the previous round.
 - **INCUBATE is not failure** — same flags for 3 rounds → save state, pause for the human.
-  Résumé with `--session`.
+  Resume with `--session`.
 - **SERENDIPITY is a pause, not a stop** — cross-domain connections flagged with `!!` by the
   Reference Critic trigger an interactive "Continue? [y/n]" prompt.
+- **Web layer is read-and-render only** — Python process owns all state; SSE hooks in
+  `session_store.py` emit events after every `save_session()` call.
 
 ---
 
@@ -122,13 +167,49 @@ Use the slash commands below in this Claude Code session instead of typing these
 | Parameter | Value | Notes |
 |---|---|---|
 | `model` | `claude-sonnet-4-6` | bump to opus for harder sessions |
-| `max_tokens_orchestrator` | 800 | raised from blueprint's 400 to prevent JSON truncation |
-| `max_tokens_rep` | 700 | LaTeX chunk content |
-| `max_rounds_per_chunk` | 4 | budget per chunk |
-| `max_chunks_per_session` | 8 | budget per session |
-| `convergence_rounds` | 2 | clean rounds → CONVERGED → chunk APPROVED |
+| `max_tokens_rep` | 400 | diff format keeps this low |
+| `max_tokens_orchestrator` | 300 | 4-field schema only |
+| `max_tokens_logic` | 100 | one line per flag |
+| `max_tokens_counterex` | 100 | ≤3 attempts |
+| `max_rounds_per_chunk` | 4 | budget per node |
+| `max_chunks_per_session` | 8 | budget per session (graph nodes) |
+| `convergence_rounds` | 2 | clean rounds → CONVERGED → node APPROVED |
 | `incubation_rounds` | 3 | stuck rounds → INCUBATE → pause |
+| `reference_critic_enabled` | `False` | enable with `--with-references` |
 | `request_delay_seconds` | 0.5 | between agent calls |
+
+---
+
+## Document model: ChunkNode and ChunkFlag
+
+```python
+@dataclass
+class ChunkNode:
+    id: str
+    title: str
+    content: str
+    type: ChunkType          # definition | lemma | theorem | proof | corollary | remark | section
+    status: ChunkStatus
+    depends_on: List[str]    # chunk ids this node directly uses
+    dependents: List[str]    # chunk ids that directly use this node (computed)
+    round_created: int
+    round_last_modified: int
+    flags: List[ChunkFlag]   # structured flags with source_agent and resolved field
+    review_requested: bool   # true if queued for re-review due to dependency change
+
+@dataclass
+class ChunkFlag:
+    source_agent: str
+    round: int
+    text: str
+    resolved: bool = False
+```
+
+Graph utility functions in `models/document.py`:
+- `topological_sort(nodes)` — Kahn's algorithm; definitions first, proofs last
+- `rebuild_dependents(nodes)` — recomputes reverse edges from `depends_on`
+- `get_context_for_chunk(nodes, chunk_id)` — direct deps only, one hop
+- `propagate_change(nodes, changed_id)` — BFS over dependents, sets `review_requested=True`
 
 ---
 
@@ -137,23 +218,23 @@ Use the slash commands below in this Claude Code session instead of typing these
 1. `COUNTEREXAMPLE` — hard stop, claim is false
 2. `SERENDIPITY` — pause, cross-domain link found, user decides
 3. `SCOUT_PURSUE / SCOUT_DROP / SCOUT_INTERESTING` — scout mode terminals
-4. `CONVERGED` — 2 consecutive clean rounds → chunk APPROVED
-5. `ELEGANT` — elegance score ≥ 8 → chunk APPROVED
+4. `CONVERGED` — 2 consecutive clean rounds → node APPROVED
+5. `ELEGANT` — elegance score ≥ 8 → node APPROVED
 6. `INCUBATE` — same flags for 3 rounds → save and pause
-7. `BUDGET` — round/chunk limit reached
+7. `BUDGET` — round/node limit reached
 8. `USER_STOP` — manual interrupt
 
 ---
 
-## Runtime user commands (while a session is running)
+## Runtime user commands (while a deep session is running)
 
-Type these in the terminal during a deep session:
+Type these in the terminal:
 
 | Input | Effect |
 |---|---|
 | `n <note>` | Queue a note for the Rep in the next round |
 | `s` | Stop after the current agent completes |
-| `skip` | Mark current chunk ABANDONED, move to next |
+| `skip` | Mark current node ABANDONED, move to next |
 | `q` | Stop immediately, save state |
 
 ---
@@ -162,13 +243,14 @@ Type these in the terminal during a deep session:
 
 | Agent | Output format |
 |---|---|
-| Rep | `---CHUNK---` ... `---END CHUNK---` then optional `PUSHBACK:` and `MEMORY NOTE:` |
+| Rep (round 1) | `---CHUNK---` ... `---END CHUNK---` then optional `PUSHBACK:` and `MEMORY NOTE:` |
+| Rep (round 2+) | `DIFF\nREPLACE:\n...\nWITH:\n...\nEND DIFF` blocks; falls back to FULL |
 | Logic Critic | One line per flag: `\ref{thm:x}, step N: error type — note` or `ok` |
 | Counterex | `COUNTEREXAMPLE FOUND` with details, or `No quick counterexample. Tried: ...` |
-| Reference | `PRIOR ART:` / `CORRECTIONS:` / `CONNECTIONS:` / `NOVEL:` — four fields, one or two lines each, no markdown |
+| Reference | `PRIOR ART:` / `CORRECTIONS:` / `CONNECTIONS:` / `NOVEL:` — four fields, no markdown |
 | Elegance | `SINCE LAST REVIEW:` / `SCORE: N` / `ISSUES:` / `SUGGESTIONS:` |
-| Orchestrator | JSON — `established`, `open_flags`, `round_goal`, `directive_for_rep`, `stopping_signal`, `stopping_reason`, `priority_issues`, `advance_chunk`, `memory_note` |
-| Decomposer | JSON — `core_claim`, `key_definitions`, `lemmas_needed`, `proof_strategy`, `chunks`, `scout_priority` |
+| Orchestrator | JSON — `directive_for_rep`, `stopping_signal`, `stopping_reason`, `advance_chunk`, `modify_dependency` |
+| Decomposer | JSON — `title`, `nodes[]` (each with `id`, `title`, `type`, `description`, `depends_on`), `global_context`, `scout_priority` |
 
 ---
 
@@ -185,9 +267,14 @@ Type these in the terminal during a deep session:
   `"error — skipped: <msg>"` and the round continues. Never crash the round.
 - **f-string + backslash** — Python 3.10 does not allow backslashes inside f-string expressions.
   Build prompts with string concatenation or assign backslash-containing strings to variables first.
-- **LaTeX in agent outputs** — chunk content is raw LaTeX (no preamble). The exporter in
+- **LaTeX in agent outputs** — node content is raw LaTeX (no preamble). The exporter in
   `output/exporter.py` adds `\documentclass{amsart}`, `\usepackage{...}`, `\newtheorem{...}`.
   Only escape LaTeX special characters in plain-text metadata (titles, session IDs).
+- **Graph invariant** — `depends_on` is the source of truth; `dependents` is always derived
+  via `rebuild_dependents()`. Never write to `dependents` directly.
+- **Manuscript passed in extra** — loops pass `extra={"manuscript": manuscript}` to every
+  agent call. Agents call `self._serialize_state(state, extra)` which routes to `_build_context`
+  when manuscript is present.
 
 ---
 
@@ -197,14 +284,7 @@ Each session writes to `math-agents/sessions/{session_id}/`:
 
 ```
 sessions/abc12345/
-├── session.json          ← full state: manuscript + RoundState + all agent memories
-├── memory/
-│   ├── orchestrator.json
-│   ├── rep.json
-│   ├── logic_critic.json
-│   ├── counterex.json
-│   ├── reference.json
-│   └── elegance.json
+├── session.json          ← full state: manuscript (nodes graph) + RoundState + all agent memories
 └── export/
     ├── manuscript.md     ← human-readable, updated every round
     └── manuscript.tex    ← compilable LaTeX, updated every round
@@ -215,8 +295,9 @@ sessions/abc12345/
 
 ## Future extensions (out of scope, architecture accommodates)
 
-- Lean/Coq formalization gateway (8th agent, runs on APPROVED chunks only)
+- Lean/Coq formalization gateway (8th agent, runs on APPROVED nodes only)
 - Elegance score history + trend plotting across rounds
 - Cross-session memory (orchestrator-level, same topic)
 - Vector search over past sessions for auto-retrieval of relevant prior work
 - Multi-topic meta-orchestrator (scout all → deep the best)
+- Graph cycle detection warning (currently appends cycle members at end of traversal order)

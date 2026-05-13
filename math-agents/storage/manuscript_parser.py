@@ -1,9 +1,10 @@
 """
 Manuscript parser.
 
-Reads an existing .tex / .md / .txt file and uses the API to extract its chunk structure.
-Builds a Manuscript object where all chunks start APPROVED (they are context, not targets),
-except the focus chunk (matched from user_focus) which is set to UNDER_REVIEW.
+Reads an existing .tex / .md / .txt file and uses the API to extract its
+chunk structure as a dependency graph. Builds a Manuscript where all nodes
+start APPROVED (context), except the focus chain (from user_focus) which
+is set to UNDER_REVIEW.
 """
 
 import json
@@ -15,34 +16,52 @@ from typing import Optional
 from anthropic import Anthropic
 
 from config import Config
-from models.document import Chunk, Manuscript
-from models.signals import ChunkStatus, SessionMode
+from models.document import ChunkNode, Manuscript, rebuild_dependents, topological_sort
+from models.signals import ChunkStatus, ChunkType, SessionMode
 from models.state import SessionScope
 
 
-_PARSE_SYSTEM = """TASK:
-Read this mathematical document and extract its structure as a list of chunks.
-Each chunk is one logical unit: a definition, lemma, theorem, proof, remark, or section.
+_TYPE_MAP = {
+    "definition": ChunkType.DEFINITION,
+    "lemma":      ChunkType.LEMMA,
+    "theorem":    ChunkType.THEOREM,
+    "proof":      ChunkType.PROOF,
+    "corollary":  ChunkType.COROLLARY,
+    "remark":     ChunkType.REMARK,
+    "section":    ChunkType.SECTION,
+}
+
+_PARSE_SYSTEM = r"""TASK:
+Read this mathematical document and extract its structure as a dependency graph.
+Each node is one logical unit: a definition, lemma, theorem, proof, remark, or section.
 
 OUTPUT FORMAT (JSON, no markdown fences):
 {
   "title": "document title or inferred topic",
-  "chunks": [
+  "nodes": [
     {
       "id": "slug_from_title",
       "title": "short label",
-      "content": "verbatim content of this chunk",
-      "type": "definition | lemma | theorem | proof | remark | section"
+      "content": "verbatim content of this node",
+      "type": "definition | lemma | theorem | proof | remark | section | corollary",
+      "depends_on": ["id_of_other_node"]
     }
   ],
-  "global_context": "2-3 sentence summary of the whole document"
+  "global_context": "2-3 sentence summary"
 }
 
+DEPENDENCY INFERENCE RULES:
+- Infer depends_on from \ref{} and \label{} in LaTeX
+- Infer from explicit mentions: "by Lemma 2", "from Definition 1", "using the above"
+- Every proof depends on its theorem node
+- Every theorem depends on the definitions it uses
+- If a dependency is ambiguous, omit it rather than guess wrong
+- depends_on lists only ids that appear in this nodes array
+
 RULES:
-- If the document has no clear structure, treat the whole thing as one chunk of type section.
-- Preserve the verbatim content of each chunk exactly as written.
-- IDs must be lowercase with underscores, e.g. thm_main, lem_cauchy, def_holomorphic.
-- 500 tokens max output."""
+- Preserve verbatim content of each node exactly as written
+- IDs must be lowercase with underscores: thm_main, lem_cauchy, def_holomorphic
+- 600 tokens max output"""
 
 
 def _strip_fences(text: str) -> str:
@@ -53,21 +72,19 @@ def _strip_fences(text: str) -> str:
     return text.strip()
 
 
-def _match_focus_chunk(chunks: list, user_focus: str) -> Optional[str]:
-    """Return the chunk id most likely to match user_focus, or None."""
-    if not user_focus or not chunks:
+def _match_focus_node(nodes_data: list, user_focus: str) -> Optional[str]:
+    """Return the node id most likely to match user_focus, or None."""
+    if not user_focus or not nodes_data:
         return None
     focus_lower = user_focus.lower()
-    # Exact id match
-    for c in chunks:
-        if c["id"] in focus_lower or focus_lower in c["id"]:
-            return c["id"]
-    # Title match
-    for c in chunks:
-        if c["title"].lower() in focus_lower or any(
-            word in c["title"].lower() for word in focus_lower.split() if len(word) > 3
+    for n in nodes_data:
+        if n["id"] in focus_lower or focus_lower in n["id"]:
+            return n["id"]
+    for n in nodes_data:
+        if n["title"].lower() in focus_lower or any(
+            word in n["title"].lower() for word in focus_lower.split() if len(word) > 3
         ):
-            return c["id"]
+            return n["id"]
     return None
 
 
@@ -80,11 +97,10 @@ def parse_manuscript(
     scope: Optional[SessionScope] = None,
 ) -> Manuscript:
     """
-    Parse a .tex / .md / .txt file into a Manuscript.
+    Parse a .tex / .md / .txt file into a Manuscript with a dependency graph.
 
-    All chunks start as APPROVED (they are background context).
-    The focus chunk (matched from user_focus) is set to UNDER_REVIEW.
-    If no focus chunk is found and user_focus is non-empty, the last chunk is the focus.
+    All nodes start as APPROVED (background context).
+    The focus node and its dependency chain are set to UNDER_REVIEW.
     """
     if config is None:
         config = Config()
@@ -98,13 +114,12 @@ def parse_manuscript(
     content = filepath.read_text(encoding="utf-8", errors="replace")
     title = filepath.stem.replace("_", " ").replace("-", " ")
 
-    # Call the API to extract structure
     api_key = __import__("os").environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY not set")
 
     client = Anthropic(api_key=api_key)
-    user_msg = f"Document title hint: {title}\n\n---\n\n{content[:8000]}"  # cap at ~8k chars
+    user_msg = f"Document title hint: {title}\n\n---\n\n{content[:8000]}"
 
     try:
         response = client.messages.create(
@@ -116,47 +131,79 @@ def parse_manuscript(
         raw = response.content[0].text
         data = json.loads(_strip_fences(raw))
     except Exception as e:
-        print(f"[WARNING] Manuscript parser API call failed: {e} — using single-chunk fallback")
+        print(f"[WARNING] Manuscript parser API call failed: {e} — using single-node fallback")
         data = {
             "title": title,
-            "chunks": [{"id": "full_doc", "title": title, "content": content, "type": "section"}],
+            "nodes": [{"id": "full_doc", "title": title, "content": content,
+                        "type": "section", "depends_on": []}],
             "global_context": f"Document: {title}",
         }
 
-    # Build Chunk objects — all start APPROVED
-    chunks_data = data.get("chunks", [])
-    if not chunks_data:
-        chunks_data = [{"id": "full_doc", "title": title, "content": content, "type": "section"}]
+    nodes_data = data.get("nodes", [])
+    if not nodes_data:
+        nodes_data = [{"id": "full_doc", "title": title, "content": content,
+                        "type": "section", "depends_on": []}]
 
-    focus_id = _match_focus_chunk(chunks_data, user_focus)
-    if focus_id is None and user_focus and chunks_data:
-        # Default: last chunk is the focus (most likely what user wants to work on)
-        focus_id = chunks_data[-1]["id"]
+    focus_id = _match_focus_node(nodes_data, user_focus)
+    if focus_id is None and user_focus and nodes_data:
+        focus_id = nodes_data[-1]["id"]
 
-    chunks: list[Chunk] = []
-    for cd in chunks_data:
-        chunk_id = cd.get("id", f"chunk_{len(chunks)}")
-        is_focus = (chunk_id == focus_id)
-        chunks.append(Chunk(
-            id=chunk_id,
-            title=cd.get("title", chunk_id),
-            content=cd.get("content", ""),
-            status=ChunkStatus.UNDER_REVIEW if is_focus else ChunkStatus.APPROVED,
+    # Build all nodes as APPROVED first
+    nodes: dict = {}
+    for nd in nodes_data:
+        nid = nd.get("id", f"node_{len(nodes)}")
+        chunk_type = _TYPE_MAP.get(nd.get("type", "section"), ChunkType.SECTION)
+        nodes[nid] = ChunkNode(
+            id=nid,
+            title=nd.get("title", nid),
+            content=nd.get("content", ""),
+            type=chunk_type,
+            status=ChunkStatus.APPROVED,
+            depends_on=[d for d in nd.get("depends_on", []) if d in {n.get("id") for n in nodes_data}],
+            dependents=[],
             round_created=0,
             round_last_modified=0,
-            flags=[],
-            approved_by_rounds=0 if is_focus else 1,
-        ))
+        )
 
-    current_chunk_id = focus_id or (chunks[0].id if chunks else "chunk_0")
+    rebuild_dependents(nodes)
+
+    # Walk backwards from focus_id and set focus chain to UNDER_REVIEW
+    if focus_id and focus_id in nodes:
+        _mark_focus_chain(nodes, focus_id)
+    current_chunk_id = focus_id or (list(nodes.keys())[0] if nodes else "chunk_0")
+
+    traversal_order = topological_sort(nodes)
 
     return Manuscript(
         topic=data.get("title", title),
         mode=mode,
-        chunks=chunks,
+        nodes=nodes,
+        traversal_order=traversal_order,
         current_chunk_id=current_chunk_id,
         global_context=data.get("global_context", ""),
         session_id=session_id,
         created_at=datetime.now(),
         scope=scope,
     )
+
+
+def _mark_focus_chain(nodes: dict, focus_id: str) -> None:
+    """
+    Mark focus_id and all its direct depends_on as UNDER_REVIEW.
+    One level back only — the spec says "walk backwards through its depends_on chain."
+    """
+    visited = set()
+    from collections import deque
+    queue = deque([focus_id])
+    while queue:
+        nid = queue.popleft()
+        if nid in visited:
+            continue
+        visited.add(nid)
+        node = nodes.get(nid)
+        if node is None:
+            continue
+        node.status = ChunkStatus.UNDER_REVIEW
+        for dep_id in node.depends_on:
+            if dep_id not in visited and dep_id in nodes:
+                queue.append(dep_id)

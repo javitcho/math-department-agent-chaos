@@ -1,6 +1,16 @@
 from enum import Enum
 
 
+class ChunkType(Enum):
+    DEFINITION = "definition"
+    LEMMA      = "lemma"
+    THEOREM    = "theorem"
+    PROOF      = "proof"
+    COROLLARY  = "corollary"
+    REMARK     = "remark"
+    SECTION    = "section"
+
+
 class ChunkStatus(Enum):
     DRAFT = "draft"
     UNDER_REVIEW = "under_review"

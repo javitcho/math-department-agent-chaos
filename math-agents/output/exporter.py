@@ -25,16 +25,10 @@ _STATUS_EMOJI = {
 
 
 # ---------------------------------------------------------------------------
-# Markdown export (unchanged from original)
+# Markdown export
 # ---------------------------------------------------------------------------
 
 def export_manuscript(manuscript: Manuscript, session_dir: Union[str, Path]) -> Path:
-    """
-    Render the Manuscript as markdown and write to
-    {session_dir}/export/manuscript.md.
-
-    Returns the path to the written file.
-    """
     session_dir = Path(session_dir)
     export_dir = session_dir / "export"
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -64,25 +58,36 @@ def export_manuscript(manuscript: Manuscript, session_dir: Union[str, Path]) -> 
         lines.append("---")
         lines.append("")
 
-    lines.append("## Manuscript Chunks")
+    lines.append("## Dependency Graph")
     lines.append("")
 
     approved_count = 0
-    for chunk in manuscript.chunks:
-        status_symbol = _STATUS_EMOJI.get(chunk.status, "?")
-        is_current = chunk.id == manuscript.current_chunk_id
+    nodes_in_order = [
+        manuscript.nodes[nid]
+        for nid in manuscript.traversal_order
+        if nid in manuscript.nodes
+    ]
+
+    for node in nodes_in_order:
+        status_symbol = _STATUS_EMOJI.get(node.status, "?")
+        is_current = node.id == manuscript.current_chunk_id
 
         current_marker = " ← current" if is_current else ""
-        lines.append(f"### {chunk.title} `[{chunk.id}]`  {status_symbol}{current_marker}")
+        dep_str = f" (deps: {', '.join(node.depends_on)})" if node.depends_on else ""
+        lines.append(f"### {node.title} `[{node.id}]`  {status_symbol}{current_marker}")
         lines.append("")
-        lines.append(f"**Status:** {chunk.status.value}  ")
-        if chunk.flags:
-            lines.append(f"**Open flags:** {', '.join(chunk.flags)}  ")
-        lines.append(f"**Last modified:** round {chunk.round_last_modified}  ")
+        lines.append(f"**Type:** {node.type.value}  ")
+        lines.append(f"**Status:** {node.status.value}{dep_str}  ")
+
+        unresolved = [f for f in node.flags if not f.resolved]
+        if unresolved:
+            flag_texts = ", ".join(f.text for f in unresolved)
+            lines.append(f"**Open flags:** {flag_texts}  ")
+        lines.append(f"**Last modified:** round {node.round_last_modified}  ")
         lines.append("")
 
-        if chunk.content:
-            lines.append(chunk.content)
+        if node.content:
+            lines.append(node.content)
         else:
             lines.append("*(no content yet)*")
 
@@ -90,11 +95,11 @@ def export_manuscript(manuscript: Manuscript, session_dir: Union[str, Path]) -> 
         lines.append("---")
         lines.append("")
 
-        if chunk.status == ChunkStatus.APPROVED:
+        if node.status == ChunkStatus.APPROVED:
             approved_count += 1
 
-    total = len(manuscript.chunks)
-    lines.append(f"*{approved_count}/{total} chunks approved.*")
+    total = len(manuscript.nodes)
+    lines.append(f"*{approved_count}/{total} nodes approved.*")
     lines.append("")
 
     out_path.write_text("\n".join(lines), encoding="utf-8")
@@ -106,15 +111,6 @@ def export_manuscript(manuscript: Manuscript, session_dir: Union[str, Path]) -> 
 # ---------------------------------------------------------------------------
 
 def export_latex(manuscript: Manuscript, session_dir: Union[str, Path]) -> Path:
-    """
-    Render the Manuscript as a compilable LaTeX file and write to
-    {session_dir}/export/manuscript.tex.
-
-    Chunk content is stored as raw LaTeX (written by the Rep agent).
-    Attempts pdflatex compilation if available; never crashes on failure.
-
-    Returns the path to the .tex file.
-    """
     session_dir = Path(session_dir)
     export_dir = session_dir / "export"
     export_dir.mkdir(parents=True, exist_ok=True)
@@ -146,7 +142,6 @@ def export_latex(manuscript: Manuscript, session_dir: Union[str, Path]) -> Path:
         "",
     ]
 
-    # Global context as abstract
     if manuscript.global_context:
         lines.append(r"\begin{abstract}")
         for bullet in manuscript.global_context.splitlines():
@@ -156,25 +151,30 @@ def export_latex(manuscript: Manuscript, session_dir: Union[str, Path]) -> Path:
         lines.append(r"\end{abstract}")
         lines.append("")
 
-    # Chunks in order
-    for chunk in manuscript.chunks:
-        is_approved = chunk.status == ChunkStatus.APPROVED
+    nodes_in_order = [
+        manuscript.nodes[nid]
+        for nid in manuscript.traversal_order
+        if nid in manuscript.nodes
+    ]
+
+    for node in nodes_in_order:
+        is_approved = node.status == ChunkStatus.APPROVED
 
         if not is_approved:
             lines.append(
-                r"% --- STATUS: " + chunk.status.value.upper()
-                + " | chunk: " + chunk.id + " ---"
+                r"% --- STATUS: " + node.status.value.upper()
+                + " | node: " + node.id + " (" + node.type.value + ") ---"
             )
-            if chunk.flags:
-                for flag in chunk.flags:
-                    lines.append(r"% OPEN FLAG: " + flag)
+            unresolved = [f for f in node.flags if not f.resolved]
+            for flag in unresolved:
+                lines.append(r"% OPEN FLAG: " + flag.text)
             lines.append(r"\medskip\noindent\rule{\linewidth}{0.4pt}\medskip")
             lines.append("")
 
-        if chunk.content:
-            lines.append(chunk.content)
+        if node.content:
+            lines.append(node.content)
         else:
-            lines.append(r"% (no content yet for chunk: " + chunk.title + ")")
+            lines.append(r"% (no content yet for node: " + node.title + ")")
 
         lines.append("")
 
@@ -186,14 +186,11 @@ def export_latex(manuscript: Manuscript, session_dir: Union[str, Path]) -> Path:
     lines.append("")
 
     tex_path.write_text("\n".join(lines), encoding="utf-8")
-
     _try_pdflatex(export_dir)
-
     return tex_path
 
 
 def _try_pdflatex(export_dir: Path) -> None:
-    """Attempt pdflatex compilation. Fails silently."""
     if not shutil.which("pdflatex"):
         print("[INFO] pdflatex not found — skipping LaTeX compilation.")
         return
@@ -209,7 +206,6 @@ def _try_pdflatex(export_dir: Path) -> None:
 
 
 def _latex_escape(text: str) -> str:
-    """Escape LaTeX special characters in plain text (for title/metadata only)."""
     replacements = [
         ("\\", r"\textbackslash{}"),
         ("&", r"\&"),
@@ -227,12 +223,7 @@ def _latex_escape(text: str) -> str:
     return text
 
 
-# ---------------------------------------------------------------------------
-# Arbitrary-path export helper (used by --export CLI flag)
-# ---------------------------------------------------------------------------
-
 def export_to_file(manuscript: Manuscript, output_path: Union[str, Path]) -> Path:
-    """Export the manuscript markdown to an arbitrary file path."""
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 

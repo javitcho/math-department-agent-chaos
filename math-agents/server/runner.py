@@ -74,16 +74,22 @@ def _serialize_manuscript_light(manuscript: Manuscript) -> dict:
         "session_id": manuscript.session_id,
         "mode": manuscript.mode.value,
         "current_chunk_id": manuscript.current_chunk_id,
-        "chunks": [
+        "nodes": [
             {
-                "id": c.id,
-                "title": c.title,
-                "content": c.content,
-                "status": c.status.value,
-                "flags": c.flags,
+                "id": n.id,
+                "title": n.title,
+                "content": n.content,
+                "type": n.type.value,
+                "status": n.status.value,
+                "depends_on": n.depends_on,
+                "dependents": n.dependents,
+                "flags": [f.text for f in n.flags if not f.resolved],
+                "review_requested": n.review_requested,
             }
-            for c in manuscript.chunks
+            for nid in manuscript.traversal_order
+            for n in [manuscript.nodes[nid]] if nid in manuscript.nodes
         ],
+        "traversal_order": manuscript.traversal_order,
     }
 
 

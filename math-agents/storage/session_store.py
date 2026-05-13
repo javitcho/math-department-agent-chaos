@@ -6,14 +6,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
-from models.document import Chunk, Manuscript
-from models.signals import ChunkStatus, SessionMode, StoppingSignal
+from models.document import ChunkFlag, ChunkNode, Manuscript, rebuild_dependents, topological_sort
+from models.signals import ChunkStatus, ChunkType, SessionMode, StoppingSignal
 from models.state import AgentMemory, MemoryEntry, RoundState, SessionScope
 
-
-# ---------------------------------------------------------------------------
-# Custom JSON encoder for dataclasses, enums, datetimes
-# ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
 # Save hooks — registered by the web server to receive live events
@@ -33,6 +29,10 @@ def remove_save_hook(fn) -> None:
     except ValueError:
         pass
 
+
+# ---------------------------------------------------------------------------
+# Custom JSON encoder
+# ---------------------------------------------------------------------------
 
 class MathAgentEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -71,16 +71,10 @@ def save_session(
     memories: Dict[str, AgentMemory],
     extra: Optional[dict] = None,
 ) -> None:
-    """
-    Serialize Manuscript + RoundState + all agent memories to
-    sessions/{session_id}/session.json.
-    Also triggers export of manuscript.md.
-    """
     session_id = manuscript.session_id
     session_dir = _session_dir(session_id)
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    # Serialize memories
     serialized_memories = {}
     for agent_id, mem in memories.items():
         serialized_memories[agent_id] = {
@@ -107,7 +101,6 @@ def save_session(
         encoding="utf-8",
     )
 
-    # Export manuscript to markdown and LaTeX
     try:
         from output.exporter import export_manuscript
         export_manuscript(manuscript, session_dir)
@@ -132,10 +125,6 @@ def save_session(
 # ---------------------------------------------------------------------------
 
 def load_session(session_id: str) -> Tuple[Manuscript, RoundState, Dict[str, AgentMemory]]:
-    """
-    Load session from sessions/{session_id}/session.json.
-    Returns (manuscript, state, memories_dict).
-    """
     session_file = _session_file(session_id)
     if not session_file.exists():
         raise FileNotFoundError(f"Session '{session_id}' not found at {session_file}")
@@ -147,11 +136,7 @@ def load_session(session_id: str) -> Tuple[Manuscript, RoundState, Dict[str, Age
     memories = {}
     for agent_id, mem_data in data.get("memories", {}).items():
         entries = [
-            MemoryEntry(
-                round=e["round"],
-                chunk_id=e["chunk_id"],
-                note=e["note"],
-            )
+            MemoryEntry(round=e["round"], chunk_id=e["chunk_id"], note=e["note"])
             for e in mem_data.get("entries", [])
         ]
         memories[agent_id] = AgentMemory(
@@ -168,7 +153,6 @@ def load_session(session_id: str) -> Tuple[Manuscript, RoundState, Dict[str, Age
 # ---------------------------------------------------------------------------
 
 def list_sessions() -> list:
-    """Return a list of dicts with info about each saved session."""
     sessions_root = _sessions_root()
     if not sessions_root.exists():
         return []
@@ -188,7 +172,7 @@ def list_sessions() -> list:
                 "topic": ms.get("topic", "unknown"),
                 "mode": ms.get("mode", "unknown"),
                 "saved_at": data.get("saved_at", "unknown"),
-                "chunk_count": len(ms.get("chunks", [])),
+                "chunk_count": len(ms.get("nodes", {})),
                 "current_chunk": ms.get("current_chunk_id", ""),
             })
         except Exception as e:
@@ -229,11 +213,71 @@ def _deserialize_scope(data: Optional[dict]) -> Optional[SessionScope]:
     )
 
 
+def _serialize_flag(f: ChunkFlag) -> dict:
+    return {
+        "source_agent": f.source_agent,
+        "round": f.round,
+        "text": f.text,
+        "resolved": f.resolved,
+    }
+
+
+def _deserialize_flag(data) -> ChunkFlag:
+    if isinstance(data, str):
+        # Backward compat: old sessions stored flags as plain strings
+        return ChunkFlag(source_agent="unknown", round=0, text=data)
+    return ChunkFlag(
+        source_agent=data.get("source_agent", "unknown"),
+        round=data.get("round", 0),
+        text=data.get("text", ""),
+        resolved=bool(data.get("resolved", False)),
+    )
+
+
+def _serialize_node(n: ChunkNode) -> dict:
+    return {
+        "id": n.id,
+        "title": n.title,
+        "content": n.content,
+        "type": n.type.value,
+        "status": n.status.value,
+        "depends_on": n.depends_on,
+        "dependents": n.dependents,
+        "round_created": n.round_created,
+        "round_last_modified": n.round_last_modified,
+        "flags": [_serialize_flag(f) for f in n.flags],
+        "review_requested": n.review_requested,
+    }
+
+
+def _deserialize_node(data: dict) -> ChunkNode:
+    chunk_type = ChunkType.SECTION
+    try:
+        chunk_type = ChunkType(data.get("type", "section"))
+    except ValueError:
+        pass
+
+    return ChunkNode(
+        id=data["id"],
+        title=data["title"],
+        content=data.get("content", ""),
+        type=chunk_type,
+        status=ChunkStatus(data.get("status", "draft")),
+        depends_on=data.get("depends_on", []),
+        dependents=data.get("dependents", []),
+        round_created=data.get("round_created", 0),
+        round_last_modified=data.get("round_last_modified", 0),
+        flags=[_deserialize_flag(f) for f in data.get("flags", [])],
+        review_requested=bool(data.get("review_requested", False)),
+    )
+
+
 def _serialize_manuscript(m: Manuscript) -> dict:
     return {
         "topic": m.topic,
         "mode": m.mode.value,
-        "chunks": [_serialize_chunk(c) for c in m.chunks],
+        "nodes": {nid: _serialize_node(n) for nid, n in m.nodes.items()},
+        "traversal_order": m.traversal_order,
         "current_chunk_id": m.current_chunk_id,
         "global_context": m.global_context,
         "session_id": m.session_id,
@@ -242,17 +286,43 @@ def _serialize_manuscript(m: Manuscript) -> dict:
     }
 
 
-def _serialize_chunk(c: Chunk) -> dict:
-    return {
-        "id": c.id,
-        "title": c.title,
-        "content": c.content,
-        "status": c.status.value,
-        "round_created": c.round_created,
-        "round_last_modified": c.round_last_modified,
-        "flags": c.flags,
-        "approved_by_rounds": c.approved_by_rounds,
-    }
+def _deserialize_manuscript(data: dict) -> Manuscript:
+    nodes_raw = data.get("nodes", {})
+
+    # Backward compat: old sessions stored a "chunks" list
+    if not nodes_raw and "chunks" in data:
+        from models.signals import ChunkType as CT
+        for c in data["chunks"]:
+            nodes_raw[c["id"]] = {
+                "id": c["id"],
+                "title": c["title"],
+                "content": c.get("content", ""),
+                "type": "section",
+                "status": c.get("status", "draft"),
+                "depends_on": [],
+                "dependents": [],
+                "round_created": c.get("round_created", 0),
+                "round_last_modified": c.get("round_last_modified", 0),
+                "flags": c.get("flags", []),
+                "review_requested": False,
+            }
+
+    nodes = {nid: _deserialize_node(nd) for nid, nd in nodes_raw.items()}
+
+    # Recompute traversal_order on load if missing or stale
+    traversal_order = data.get("traversal_order") or topological_sort(nodes)
+
+    return Manuscript(
+        topic=data["topic"],
+        mode=SessionMode(data["mode"]),
+        nodes=nodes,
+        traversal_order=traversal_order,
+        current_chunk_id=data["current_chunk_id"],
+        global_context=data.get("global_context", ""),
+        session_id=data["session_id"],
+        created_at=datetime.fromisoformat(data["created_at"]),
+        scope=_deserialize_scope(data.get("scope")),
+    )
 
 
 def _serialize_state(s: RoundState) -> dict:
@@ -272,33 +342,6 @@ def _serialize_state(s: RoundState) -> dict:
         "scout_verdict": s.scout_verdict,
         "scope": _serialize_scope(s.scope),
     }
-
-
-def _deserialize_manuscript(data: dict) -> Manuscript:
-    chunks = [_deserialize_chunk(c) for c in data.get("chunks", [])]
-    return Manuscript(
-        topic=data["topic"],
-        mode=SessionMode(data["mode"]),
-        chunks=chunks,
-        current_chunk_id=data["current_chunk_id"],
-        global_context=data.get("global_context", ""),
-        session_id=data["session_id"],
-        created_at=datetime.fromisoformat(data["created_at"]),
-        scope=_deserialize_scope(data.get("scope")),
-    )
-
-
-def _deserialize_chunk(data: dict) -> Chunk:
-    return Chunk(
-        id=data["id"],
-        title=data["title"],
-        content=data.get("content", ""),
-        status=ChunkStatus(data["status"]),
-        round_created=data.get("round_created", 0),
-        round_last_modified=data.get("round_last_modified", 0),
-        flags=data.get("flags", []),
-        approved_by_rounds=data.get("approved_by_rounds", 0),
-    )
 
 
 def _deserialize_state(data: dict) -> RoundState:

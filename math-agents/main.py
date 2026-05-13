@@ -235,7 +235,7 @@ def _cmd_manuscript(
         sys.exit(1)
 
     display_success(
-        f"Parsed {len(manuscript.chunks)} chunks. "
+        f"Parsed {len(manuscript.nodes)} nodes. "
         f"Focus: {manuscript.current_chunk_id}"
     )
 
@@ -248,10 +248,9 @@ def _cmd_manuscript(
         mode=mode,
         established=[f"Source document: {manuscript.topic}"],
         current_chunk_id=manuscript.current_chunk_id,
-        current_chunk_title=next(
-            (c.title for c in manuscript.chunks if c.id == manuscript.current_chunk_id),
-            manuscript.current_chunk_id,
-        ),
+        current_chunk_title=manuscript.nodes[manuscript.current_chunk_id].title
+            if manuscript.current_chunk_id in manuscript.nodes
+            else manuscript.current_chunk_id,
         focus_text="",
         open_flags=[],
         round_goal=f"Focus on: {scope.user_focus or manuscript.current_chunk_id}",

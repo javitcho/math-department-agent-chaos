@@ -28,6 +28,132 @@ function SignalDot({ label, active, color }) {
   )
 }
 
+const STATUS_COLOR = {
+  draft:        '#3a3020',
+  under_review: '#C9A84C',
+  approved:     '#5BAA8F',
+  flagged:      '#C96B6B',
+  needs_rework: '#C96B6B',
+  abandoned:    '#2a2418',
+}
+
+const NODE_W = 88
+const NODE_H = 18
+const LEVEL_GAP = 36   // vertical spacing between rank levels
+const COL_GAP = 10     // horizontal gap between nodes in same level
+
+function DependencyGraph({ nodes, traversalOrder, currentId }) {
+  if (!nodes || !nodes.length) return null
+
+  const nodeMap = {}
+  nodes.forEach(n => { nodeMap[n.id] = n })
+
+  // Compute rank for each node (longest path from roots)
+  const rank = {}
+  const computeRank = (id) => {
+    if (rank[id] !== undefined) return rank[id]
+    const n = nodeMap[id]
+    if (!n || !n.depends_on || n.depends_on.length === 0) { rank[id] = 0; return 0 }
+    const r = Math.max(...n.depends_on.filter(d => nodeMap[d]).map(d => computeRank(d) + 1))
+    rank[id] = r
+    return r
+  }
+  ;(traversalOrder || []).forEach(id => computeRank(id))
+
+  // Group by rank
+  const levels = {}
+  ;(traversalOrder || []).forEach(id => {
+    const r = rank[id] ?? 0
+    if (!levels[r]) levels[r] = []
+    levels[r].push(id)
+  })
+  const maxRank = Math.max(...Object.keys(levels).map(Number))
+
+  // Assign positions: rank → row (top to bottom), within rank → column (center)
+  const pos = {}
+  const containerW = 200
+
+  for (let r = 0; r <= maxRank; r++) {
+    const group = levels[r] || []
+    const totalW = group.length * NODE_W + (group.length - 1) * COL_GAP
+    const startX = (containerW - totalW) / 2
+    group.forEach((id, i) => {
+      pos[id] = {
+        x: startX + i * (NODE_W + COL_GAP),
+        y: r * (NODE_H + LEVEL_GAP) + 4,
+      }
+    })
+  }
+
+  const svgH = (maxRank + 1) * (NODE_H + LEVEL_GAP) + 12
+
+  // Draw edges
+  const edges = []
+  ;(traversalOrder || []).forEach(id => {
+    const n = nodeMap[id]
+    if (!n) return
+    ;(n.depends_on || []).forEach(depId => {
+      if (!pos[depId] || !pos[id]) return
+      const sx = pos[depId].x + NODE_W / 2
+      const sy = pos[depId].y + NODE_H
+      const tx = pos[id].x + NODE_W / 2
+      const ty = pos[id].y
+      const cy = (sy + ty) / 2
+      edges.push(
+        <path
+          key={depId + '→' + id}
+          d={"M " + sx + " " + sy + " C " + sx + " " + cy + ", " + tx + " " + cy + ", " + tx + " " + ty}
+          stroke="#2e2820" strokeWidth={1.5} fill="none" markerEnd="url(#arr)"
+        />
+      )
+    })
+  })
+
+  // Draw nodes
+  const nodeEls = (traversalOrder || []).map(id => {
+    const n = nodeMap[id]
+    if (!n || !pos[id]) return null
+    const color = STATUS_COLOR[n.status] || '#3a3020'
+    const isCurrent = id === currentId
+    const { x, y } = pos[id]
+    const label = n.title.length > 13 ? n.title.slice(0, 12) + '…' : n.title
+    return (
+      <g key={id} style={{ cursor: 'default' }}>
+        <title>{n.title} ({n.type}) — {n.status}{n.review_requested ? ' [re-review]' : ''}</title>
+        <rect
+          x={x} y={y} width={NODE_W} height={NODE_H} rx={3}
+          fill={isCurrent ? color + '22' : '#13120f'}
+          stroke={color}
+          strokeWidth={isCurrent ? 1.5 : 1}
+        />
+        <text
+          x={x + NODE_W / 2} y={y + NODE_H / 2 + 4}
+          textAnchor="middle" fontSize={9}
+          fontFamily="var(--font-mono)"
+          fill={color}
+        >
+          {label}
+        </text>
+        {n.review_requested && (
+          <circle cx={x + NODE_W - 4} cy={y + 4} r={3} fill="#C9A84C" />
+        )}
+      </g>
+    )
+  })
+
+  return (
+    <svg width={containerW} height={svgH} style={{ display: 'block', overflow: 'visible' }}>
+      <defs>
+        <marker id="arr" markerWidth={6} markerHeight={6} refX={6} refY={3} orient="auto">
+          <path d="M0,0 L0,6 L6,3 Z" fill="#2e2820" />
+        </marker>
+      </defs>
+      {edges}
+      {nodeEls}
+    </svg>
+  )
+}
+
 function Section({ label, children }) {
   return (
     <div style={{ marginBottom: 22 }}>
@@ -39,7 +165,7 @@ function Section({ label, children }) {
   )
 }
 
-export default function SupervisorPanel({ state, scope, scopeChange, running, stopInfo, queuedNote, onStop, onContinue, onNewTopic, onExport }) {
+export default function SupervisorPanel({ state, scope, scopeChange, nodes, traversalOrder, running, stopInfo, queuedNote, onStop, onContinue, onNewTopic, onExport }) {
   const signal = state?.stopping_signal?.toLowerCase() || 'continue'
   const meta = STOP_META[signal] || STOP_META.continue
 
@@ -141,6 +267,18 @@ export default function SupervisorPanel({ state, scope, scopeChange, running, st
                   {scope.tone_notes}
                 </div>
               )}
+            </div>
+          </Section>
+        )}
+
+        {nodes && nodes.length > 0 && (
+          <Section label="Dependency Graph">
+            <div style={{ overflowX: 'auto' }}>
+              <DependencyGraph
+                nodes={nodes}
+                traversalOrder={traversalOrder || nodes.map(n => n.id)}
+                currentId={state?.current_chunk_id}
+              />
             </div>
           </Section>
         )}

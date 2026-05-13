@@ -61,7 +61,7 @@ CONSTRAINTS:
 - A counterexample you are unsure about should be flagged as a QUESTION, not reported as found."""
 
     def _build_user_message(self, state: RoundState, memory: AgentMemory, extra: dict) -> str:
-        state_block = self._serialize_state(state)
+        state_block = self._serialize_state(state, extra)
         memory_block = self._serialize_memory(memory)
 
         return f"""{state_block}
