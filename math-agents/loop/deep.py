@@ -119,6 +119,7 @@ def run_deep(
     existing_state: Optional[RoundState] = None,
     existing_memories: Optional[Dict[str, AgentMemory]] = None,
     injected_note: Optional[str] = None,
+    scope=None,
 ) -> dict:
     """
     Run deep mode on a topic.
@@ -141,7 +142,7 @@ def run_deep(
         manuscript, state, memories = _build_from_scout(prior_scout, session_id, config)
         display_info(f"[Deep] Starting deep session from scout result — {session_id}")
     else:
-        manuscript, state, memories = _build_fresh(topic, session_id, config)
+        manuscript, state, memories = _build_fresh(topic, session_id, config, scope=scope)
         display_info(f"[Deep] Starting fresh deep session — {session_id}")
 
     # Inject note if provided
@@ -191,6 +192,8 @@ def run_deep(
             # Initialize convergence tracking for this chunk
             chunk_consecutive_clean.setdefault(chunk.id, 0)
             chunk_flag_history.setdefault(chunk.id, [])
+            prev_round_logic_ok = True   # elegance gating across rounds
+            force_full_next = False      # rep diff fallback
 
             # ----------------------------------------------------------------
             # Inner loop: rounds per chunk
@@ -217,12 +220,17 @@ def run_deep(
 
                 display_info(f"[Deep] Round {round_num + 1} — chunk: {chunk.id}")
 
-                # ---- Rep
-                rep_output = _safe_call(rep_agent, "rep", state, memories, session_id, round_num, chunk.id)
-                chunk_content = rep_agent.extract_chunk_content(rep_output)
-                chunk.content = chunk_content
+                # ---- Rep (diff format; FULL if first draft or fallback requested)
+                rep_extra = {}
+                if force_full_next:
+                    rep_extra["force_full"] = True
+                    force_full_next = False
+                rep_output = _safe_call(rep_agent, "rep", state, memories, session_id, round_num, chunk.id,
+                                        extra=rep_extra)
+                new_content, force_full_next = rep_agent.apply_rep_output(rep_output, chunk.content or "")
+                chunk.content = new_content
                 chunk.round_last_modified = round_num + 1
-                state.focus_text = chunk_content
+                state.focus_text = new_content
                 _extract_and_store_memory(rep_agent, rep_output, "MEMORY NOTE", memories, "rep", session_id, round_num + 1, chunk.id, config)
                 save_session(manuscript, state, memories)
 
@@ -242,15 +250,39 @@ def run_deep(
                 _extract_and_store_memory(counterex_agent, counterex_result, "MEMORY NOTE", memories, "counterex", session_id, round_num + 1, chunk.id, config)
                 save_session(manuscript, state, memories)
 
-                # ---- Reference
-                ref_notes = _safe_call(reference_agent, "reference", state, memories, session_id, round_num, chunk.id)
-                _extract_and_store_memory(reference_agent, ref_notes, "MEMORY NOTE", memories, "reference", session_id, round_num + 1, chunk.id, config)
-                save_session(manuscript, state, memories)
+                # ---- Reference (opt-in, specific rounds only)
+                if config.reference_critic_enabled and (round_num + 1) in config.reference_critic_rounds:
+                    ref_notes = _safe_call(reference_agent, "reference", state, memories, session_id, round_num, chunk.id)
+                    _extract_and_store_memory(reference_agent, ref_notes, "MEMORY NOTE", memories, "reference", session_id, round_num + 1, chunk.id, config)
+                    save_session(manuscript, state, memories)
+                else:
+                    ref_notes = "(not run)"
 
-                # ---- Elegance
-                elegance_notes = _safe_call(elegance_agent, "elegance", state, memories, session_id, round_num, chunk.id)
-                _extract_and_store_memory(elegance_agent, elegance_notes, "MEMORY NOTE", memories, "elegance", session_id, round_num + 1, chunk.id, config)
-                save_session(manuscript, state, memories)
+                # ---- Elegance (every other round; only if logic was clean last round)
+                elegance_should_run = (round_num % 2 == 0) and (round_num == 0 or prev_round_logic_ok)
+                if elegance_should_run:
+                    elegance_notes = _safe_call(elegance_agent, "elegance", state, memories, session_id, round_num, chunk.id)
+                    _extract_and_store_memory(elegance_agent, elegance_notes, "MEMORY NOTE", memories, "elegance", session_id, round_num + 1, chunk.id, config)
+                    save_session(manuscript, state, memories)
+                else:
+                    elegance_notes = "(skipped)"
+
+                # ---- Orchestrator
+                # ---- Derive flags from critics (not from orchestrator)
+                logic_ok = "ok" in logic_flags.lower() and "error" not in logic_flags.lower()
+                no_counterex = "COUNTEREXAMPLE FOUND" not in counterex_result.upper()
+                if logic_ok and no_counterex:
+                    new_flags = []
+                else:
+                    new_flags = [
+                        line.strip() for line in logic_flags.splitlines()
+                        if line.strip() and line.strip().lower() != "ok"
+                        and not line.strip().startswith("#")
+                        and not line.strip().startswith("%")
+                        and "MEMORY NOTE" not in line
+                    ][:5]
+                    if not no_counterex:
+                        new_flags = ["COUNTEREXAMPLE: " + counterex_result[:120]] + new_flags[:4]
 
                 # ---- Orchestrator
                 try:
@@ -264,32 +296,31 @@ def run_deep(
                         elegance_notes=elegance_notes,
                         scout_mode=False,
                     )
-                    mem_note = orch_output.get("memory_note", "")
                     memories["orchestrator"] = append_memory_entry(
                         "orchestrator", session_id, round_num + 1, chunk.id,
-                        mem_note or f"Round {round_num + 1} complete",
+                        orch_output.get("memory_note") or f"Round {round_num + 1} complete",
                         config.max_memory_entries, config.memory_compress_to,
                     )
                 except Exception as e:
                     display_warning(f"Orchestrator failed: {e}")
                     orch_output = _fallback_orch_output(state, str(e))
 
+                # Inject derived fields into orch_output dict for display
+                orch_output["open_flags"] = new_flags
+                orch_output["round_goal"] = state.round_goal
+
                 save_session(manuscript, state, memories)
 
                 # ---- Update state from orchestrator output
-                state = _apply_orch_output(state, orch_output, chunk)
-
-                # ---- Update chunk flags
-                new_flags = orch_output.get("open_flags", state.open_flags)
+                state = _apply_orch_output(state, orch_output, chunk, new_flags)
                 chunk.flags = new_flags
 
                 # ---- Track convergence
                 flag_history = chunk_flag_history[chunk.id]
                 flag_history.append(list(new_flags))
 
-                logic_ok = "ok" in logic_flags.lower() and "error" not in logic_flags.lower()
-                no_counterex = "COUNTEREXAMPLE FOUND" not in counterex_result.upper()
                 no_new_flags = not new_flags
+                prev_round_logic_ok = logic_ok
 
                 if logic_ok and no_counterex and no_new_flags:
                     chunk_consecutive_clean[chunk.id] = chunk_consecutive_clean.get(chunk.id, 0) + 1
@@ -395,10 +426,12 @@ def run_deep(
 # ---------------------------------------------------------------------------
 
 def _safe_call(agent, agent_id: str, state: RoundState, memories: dict,
-               session_id: str, round_num: int, chunk_id: str) -> str:
+               session_id: str, round_num: int, chunk_id: str,
+               extra: dict = None) -> str:
     """Call an agent safely, returning a graceful error string on failure."""
     try:
-        return agent.call(state, memories.get(agent_id, AgentMemory(agent_id, session_id)))
+        return agent.call(state, memories.get(agent_id, AgentMemory(agent_id, session_id)),
+                          extra=extra or {})
     except Exception as e:
         msg = f"error — skipped: {e}"
         display_warning(f"{agent_id} failed: {e}")
@@ -460,22 +493,23 @@ def _build_round_state(
         stopping_reason="",
         priority_issues=open_flags[:3],
         scout_verdict=None,
+        scope=manuscript.scope,
     )
 
 
-def _apply_orch_output(state: RoundState, orch_output: dict, chunk: Chunk) -> RoundState:
-    """Update state with orchestrator output."""
+def _apply_orch_output(state: RoundState, orch_output: dict, chunk: Chunk,
+                       new_flags: list) -> RoundState:
+    """Update state with orchestrator output. Flags/established derived from session state."""
     signal = orch_output.get("stopping_signal", StoppingSignal.CONTINUE)
     if not isinstance(signal, StoppingSignal):
         signal = StoppingSignal.CONTINUE
 
     state.stopping_signal = signal
     state.stopping_reason = orch_output.get("stopping_reason", "")
-    state.open_flags = orch_output.get("open_flags", state.open_flags)
-    state.round_goal = orch_output.get("round_goal", state.round_goal)
     state.directive_for_rep = orch_output.get("directive_for_rep", state.directive_for_rep)
-    state.established = orch_output.get("established", state.established)
-    state.priority_issues = orch_output.get("priority_issues", [])
+    state.open_flags = new_flags
+    state.priority_issues = new_flags[:3]
+    # round_goal and established preserved from _build_round_state
     return state
 
 
@@ -490,7 +524,7 @@ def _update_global_context(manuscript: Manuscript) -> None:
     manuscript.global_context = "\n".join(bullets)
 
 
-def _build_fresh(topic: str, session_id: str, config: Config):
+def _build_fresh(topic: str, session_id: str, config: Config, scope=None):
     """Decompose topic and build fresh manuscript + state + memories."""
     decomposer = DecomposerAgent(config)
     display_info("[Deep] Running decomposer...")
@@ -527,6 +561,7 @@ def _build_fresh(topic: str, session_id: str, config: Config):
         global_context="",
         session_id=session_id,
         created_at=datetime.now(),
+        scope=scope,
     )
 
     established = []
@@ -543,6 +578,7 @@ def _build_fresh(topic: str, session_id: str, config: Config):
         open_flags=[],
         round_goal="Begin deep session",
         directive_for_rep="Write a first draft of the chunk.",
+        scope=scope,
     )
 
     memories = _init_memories(session_id)
@@ -601,18 +637,15 @@ def _init_memories(session_id: str) -> Dict[str, AgentMemory]:
 
 
 def _fallback_orch_output(state: RoundState, error_msg: str) -> dict:
-    """Return a safe fallback orchestrator output."""
+    """Return a safe fallback orchestrator output (4-field schema)."""
     return {
         "stopping_signal": StoppingSignal.CONTINUE,
         "stopping_reason": f"Orchestrator error: {error_msg}",
-        "established": state.established,
-        "current_chunk_id": state.current_chunk_id,
-        "open_flags": state.open_flags,
-        "round_goal": state.round_goal,
         "directive_for_rep": state.directive_for_rep,
-        "priority_issues": [],
         "advance_chunk": False,
         "memory_note": "",
+        "scout_verdict": None,
+        "scout_reason": "",
         "raw": error_msg,
     }
 

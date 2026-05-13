@@ -10,6 +10,8 @@ class CounterexAgent(BaseAgent):
     Hard step limit: ≤3 attempts. This is a quick sanity filter.
     """
 
+    needs_full_chunk: bool = False
+
     def __init__(self, config: Config):
         super().__init__("counterex", config)
 

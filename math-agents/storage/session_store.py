@@ -8,12 +8,31 @@ from typing import Dict, Optional, Tuple
 
 from models.document import Chunk, Manuscript
 from models.signals import ChunkStatus, SessionMode, StoppingSignal
-from models.state import AgentMemory, MemoryEntry, RoundState
+from models.state import AgentMemory, MemoryEntry, RoundState, SessionScope
 
 
 # ---------------------------------------------------------------------------
 # Custom JSON encoder for dataclasses, enums, datetimes
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Save hooks — registered by the web server to receive live events
+# ---------------------------------------------------------------------------
+
+_save_hooks: list = []
+
+
+def add_save_hook(fn) -> None:
+    if fn not in _save_hooks:
+        _save_hooks.append(fn)
+
+
+def remove_save_hook(fn) -> None:
+    try:
+        _save_hooks.remove(fn)
+    except ValueError:
+        pass
+
 
 class MathAgentEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -101,6 +120,12 @@ def save_session(
     except Exception as e:
         print(f"[WARNING] LaTeX export failed: {e}")
 
+    for hook in list(_save_hooks):
+        try:
+            hook(manuscript, state, memories)
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # Load
@@ -176,6 +201,34 @@ def list_sessions() -> list:
 # Serialization helpers
 # ---------------------------------------------------------------------------
 
+def _serialize_scope(s) -> Optional[dict]:
+    if s is None:
+        return None
+    return {
+        "purpose": s.purpose,
+        "audience": s.audience,
+        "rigor": s.rigor,
+        "stopping_preference": s.stopping_preference,
+        "tone_notes": s.tone_notes,
+        "from_manuscript": s.from_manuscript,
+        "user_focus": s.user_focus,
+    }
+
+
+def _deserialize_scope(data: Optional[dict]) -> Optional[SessionScope]:
+    if not data:
+        return None
+    return SessionScope(
+        purpose=data.get("purpose", "exploration"),
+        audience=data.get("audience", "self"),
+        rigor=data.get("rigor", "sketch"),
+        stopping_preference=data.get("stopping_preference", "natural"),
+        tone_notes=data.get("tone_notes", ""),
+        from_manuscript=bool(data.get("from_manuscript", False)),
+        user_focus=data.get("user_focus", ""),
+    )
+
+
 def _serialize_manuscript(m: Manuscript) -> dict:
     return {
         "topic": m.topic,
@@ -185,6 +238,7 @@ def _serialize_manuscript(m: Manuscript) -> dict:
         "global_context": m.global_context,
         "session_id": m.session_id,
         "created_at": m.created_at.isoformat(),
+        "scope": _serialize_scope(m.scope),
     }
 
 
@@ -216,6 +270,7 @@ def _serialize_state(s: RoundState) -> dict:
         "stopping_reason": s.stopping_reason,
         "priority_issues": s.priority_issues,
         "scout_verdict": s.scout_verdict,
+        "scope": _serialize_scope(s.scope),
     }
 
 
@@ -229,6 +284,7 @@ def _deserialize_manuscript(data: dict) -> Manuscript:
         global_context=data.get("global_context", ""),
         session_id=data["session_id"],
         created_at=datetime.fromisoformat(data["created_at"]),
+        scope=_deserialize_scope(data.get("scope")),
     )
 
 
@@ -260,4 +316,5 @@ def _deserialize_state(data: dict) -> RoundState:
         stopping_reason=data.get("stopping_reason", ""),
         priority_issues=data.get("priority_issues", []),
         scout_verdict=data.get("scout_verdict"),
+        scope=_deserialize_scope(data.get("scope")),
     )

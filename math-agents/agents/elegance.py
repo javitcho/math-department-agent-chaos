@@ -7,7 +7,10 @@ class EleganceAgent(BaseAgent):
     """
     Elegance Critic agent. Evaluates mathematical beauty of the current chunk.
     Scores 1-10, lists issues and improvement suggestions.
+    Runs every other round and only when logic was clean last round.
     """
+
+    needs_full_chunk: bool = False
 
     def __init__(self, config: Config):
         super().__init__("elegance", config)
@@ -67,7 +70,12 @@ CONSTRAINTS:
 - Do not repeat suggestions from prior rounds that have already been addressed.
 - Do not propose alternative proofs or suggest new mathematical content. Evaluate and improve what is already written.
 - If a suggestion would require rewriting more than one sentence, do not list it as a SUGGESTIONS item. Instead prefix it with "STRUCTURAL NOTE:" — the orchestrator will handle it.
-- The SINCE LAST REVIEW line is mandatory. It must appear before SCORE."""
+- The SINCE LAST REVIEW line is mandatory. It must appear before SCORE.
+- SCOPE-AWARE BEHAVIOR (calibrate to SESSION SCOPE in the user message if present):
+  For undergraduate audience: a score of 7 means "clear, well-motivated, accessible". State which standard you apply.
+  For research/paper purpose: a score of 7 means "correct but unremarkable". State which standard you apply.
+  For lecture_notes: prioritize clarity and motivation over conciseness in your suggestions.
+  For sketch or intuition_first rigor: do not penalize deliberate informality in the proof."""
 
     def _build_user_message(self, state: RoundState, memory: AgentMemory, extra: dict) -> str:
         state_block = self._serialize_state(state)

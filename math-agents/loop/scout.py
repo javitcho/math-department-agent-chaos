@@ -10,6 +10,8 @@ from datetime import datetime
 from typing import Optional
 
 from config import Config
+import copy
+
 from agents.decomposer import DecomposerAgent
 from agents.rep import RepAgent
 from agents.logic_critic import LogicCriticAgent
@@ -27,7 +29,7 @@ from output.display import (
 )
 
 
-def run_scout(topic: str, config: Config, session_id: Optional[str] = None) -> dict:
+def run_scout(topic: str, config: Config, session_id: Optional[str] = None, scope=None) -> dict:
     """
     Run scout mode on a topic.
 
@@ -37,6 +39,13 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None) -> d
     """
     if session_id is None:
         session_id = str(uuid.uuid4())[:8]
+
+    # Use tighter scout-specific token budgets
+    config = copy.copy(config)
+    config.max_tokens_rep          = config.scout_max_tokens_rep
+    config.max_tokens_logic        = config.scout_max_tokens_logic
+    config.max_tokens_counterex    = config.scout_max_tokens_counterex
+    config.max_tokens_orchestrator = config.scout_max_tokens_orchestrator
 
     display_info(f"[Scout] Starting session {session_id} — topic: {topic}")
 
@@ -91,13 +100,13 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None) -> d
         global_context="",
         session_id=session_id,
         created_at=datetime.now(),
+        scope=scope,
     )
 
     # ------------------------------------------------------------------
     # Step 3: Build initial RoundState
     # ------------------------------------------------------------------
     established = []
-    # Add core claim and key definitions to established if available
     if decomp.get("core_claim"):
         established.append(f"Core claim: {decomp['core_claim']}")
     for defn in decomp.get("key_definitions", [])[:3]:
@@ -113,6 +122,7 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None) -> d
         open_flags=[],
         round_goal=f"Scout: evaluate the core claim — '{decomp.get('core_claim', topic)}'",
         directive_for_rep="Write a first draft of this chunk. Be concise and mathematically precise.",
+        scope=scope,
     )
 
     # Initialize memories
@@ -129,8 +139,8 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None) -> d
 
     try:
         rep_output = rep_agent.call(state, memories["rep"])
-        # Update chunk content from rep output
-        chunk_content = rep_agent.extract_chunk_content(rep_output)
+        # Scout is always a first draft — always FULL format
+        chunk_content, _ = rep_agent.apply_rep_output(rep_output, focus_chunk.content or "")
         focus_chunk.content = chunk_content
         focus_chunk.status = ChunkStatus.UNDER_REVIEW
         focus_chunk.round_last_modified = 1
@@ -212,23 +222,34 @@ def run_scout(topic: str, config: Config, session_id: Optional[str] = None) -> d
             "stopping_reason": f"Orchestrator error: {e}",
             "scout_verdict": "INTERESTING",
             "scout_reason": "Could not evaluate — orchestrator error.",
-            "open_flags": [],
-            "established": established,
             "directive_for_rep": "",
-            "round_goal": "",
-            "priority_issues": [],
             "advance_chunk": False,
             "memory_note": "",
         }
 
+    # Derive flags from critics (not from orchestrator)
+    logic_ok = "ok" in logic_flags.lower() and "error" not in logic_flags.lower()
+    no_counterex = "COUNTEREXAMPLE FOUND" not in counterex_result.upper()
+    if logic_ok and no_counterex:
+        new_flags = []
+    else:
+        new_flags = [line.strip() for line in logic_flags.splitlines()
+                     if line.strip() and line.strip().lower() != "ok"][:5]
+        if not no_counterex:
+            new_flags = ["COUNTEREXAMPLE: " + counterex_result[:120]] + new_flags[:4]
+
+    # Inject display fields back into orch_output (display.py expects these)
+    orch_output["open_flags"] = new_flags
+    orch_output["round_goal"] = state.round_goal
+
     # Update state with orchestrator output
     state.stopping_signal = orch_output.get("stopping_signal", StoppingSignal.SCOUT_INTERESTING)
     state.stopping_reason = orch_output.get("stopping_reason", "")
-    state.open_flags = orch_output.get("open_flags", [])
+    state.open_flags = new_flags
     state.scout_verdict = orch_output.get("scout_verdict")
 
     # Update chunk flags
-    focus_chunk.flags = state.open_flags
+    focus_chunk.flags = new_flags
 
     # Save final scout state
     save_session(manuscript, state, memories)

@@ -8,7 +8,10 @@ class ReferenceAgent(BaseAgent):
     Reference Critic agent. Checks the literature for prior art, citation correctness,
     cross-domain connections, and novelty. Cross-domain connections marked with !! trigger
     the SERENDIPITY stopping signal.
+    Opt-in only — disabled by default (config.reference_critic_enabled).
     """
+
+    needs_full_chunk: bool = False
 
     def __init__(self, config: Config):
         super().__init__("reference", config)

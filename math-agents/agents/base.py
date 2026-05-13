@@ -1,12 +1,12 @@
 import os
 import time
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from anthropic import Anthropic
 
 from config import Config
-from models.state import AgentMemory, MemoryEntry, RoundState
+from models.state import AgentMemory, MemoryEntry, RoundState, SessionScope
 from models.signals import StoppingSignal
 from storage.memory_store import load_memory, save_memory
 
@@ -26,7 +26,10 @@ class BaseAgent:
 
     Optionally override:
       _uses_search() -> bool  (default False)
+      needs_full_chunk: bool  (default True — False truncates focus_text to 800 chars)
     """
+
+    needs_full_chunk: bool = True
 
     def __init__(self, agent_id: str, config: Config):
         self.agent_id = agent_id
@@ -60,7 +63,11 @@ class BaseAgent:
             system=system,
             messages=[{"role": "user", "content": user}],
         )
-        return response.content[0].text
+        raw = response.content[0].text
+        char_estimate = max_tokens * 4
+        if len(raw) > char_estimate:
+            print(f"[WARNING] {self.agent_id} output {len(raw)} chars exceeds ~{max_tokens}-token estimate")
+        return raw
 
     def load_memory(self, session_id: str) -> AgentMemory:
         """Load this agent's memory for the given session."""
@@ -103,6 +110,20 @@ class BaseAgent:
     # ------------------------------------------------------------------
     # Helpers for subclasses
     # ------------------------------------------------------------------
+
+    def build_scope_context(self, scope: Optional[SessionScope]) -> str:
+        """Serialize a SessionScope into a prompt block for agent system messages."""
+        if scope is None:
+            return ""
+        return (
+            "SESSION SCOPE:\n"
+            f"Purpose: {scope.purpose}\n"
+            f"Audience: {scope.audience}\n"
+            f"Rigor: {scope.rigor}\n"
+            f"Stopping preference: {scope.stopping_preference}\n"
+            f"Tone: {scope.tone_notes if scope.tone_notes else 'standard'}\n"
+            f"User focus: {scope.user_focus if scope.user_focus else 'none specified'}"
+        )
 
     def _serialize_memory(self, memory: AgentMemory) -> str:
         """Serialize memory to a compact bulleted list for inclusion in user messages."""
@@ -148,7 +169,14 @@ class BaseAgent:
 
         lines.append("")
         lines.append("FOCUS CHUNK TEXT:")
-        lines.append(state.focus_text or "(empty)")
+        focus = state.focus_text or "(empty)"
+        if not self.needs_full_chunk and len(focus) > 800:
+            focus = focus[:800] + "\n[truncated]"
+        lines.append(focus)
+
+        if state.scope is not None:
+            lines.append("")
+            lines.append(self.build_scope_context(state.scope))
 
         return "\n".join(lines)
 

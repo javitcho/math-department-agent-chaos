@@ -20,8 +20,118 @@ from rich.rule import Rule
 from rich.text import Text
 
 from models.signals import StoppingSignal
+from models.state import SessionScope
 
 console = Console()
+
+
+# ---------------------------------------------------------------------------
+# Session scope confirmation
+# ---------------------------------------------------------------------------
+
+_SCOPE_FIELDS = [
+    ("purpose",              "Purpose"),
+    ("audience",             "Audience"),
+    ("rigor",                "Rigor"),
+    ("stopping_preference",  "Stopping preference"),
+    ("tone_notes",           "Tone"),
+    ("user_focus",           "User focus"),
+]
+
+_SCOPE_DEFAULTS = {
+    "purpose": "exploration",
+    "audience": "self",
+    "rigor": "sketch",
+    "stopping_preference": "natural",
+    "tone_notes": "standard",
+    "user_focus": "none specified",
+}
+
+
+def display_scope_confirmation(
+    scope: SessionScope,
+    topic: str,
+    mode: str,
+) -> SessionScope:
+    """
+    Show the session scope panel and prompt "Start with this scope? [y/n/edit]".
+    Returns the (possibly edited) scope. Editing loops until the user confirms with y.
+    """
+    while True:
+        _print_scope_panel(scope, topic, mode)
+        try:
+            answer = input("Start with this scope? [y/n/edit]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "y"
+
+        if answer == "y" or answer == "":
+            return scope
+        if answer == "n":
+            raise SystemExit(0)
+        if answer == "edit":
+            scope = _edit_scope(scope)
+            # Loop back to show the updated panel
+
+
+def _print_scope_panel(scope: SessionScope, topic: str, mode: str) -> None:
+    console.print()
+    lines = [
+        f"Topic:    {topic}",
+        f"Purpose:  {scope.purpose}",
+        f"Audience: {scope.audience}",
+        f"Rigor:    {scope.rigor}",
+        f"Stopping: {scope.stopping_preference}",
+        f"Tone:     {scope.tone_notes if scope.tone_notes else 'standard'}",
+        f"Focus:    {scope.user_focus if scope.user_focus else 'full document'}",
+        f"Mode:     {mode}",
+    ]
+    console.print(Panel(
+        "\n".join(lines),
+        title="[bold cyan]SESSION SCOPE[/bold cyan]",
+        border_style="cyan",
+        box=box.HEAVY,
+        padding=(0, 2),
+    ))
+
+
+def _edit_scope(scope: SessionScope) -> SessionScope:
+    """Prompt the user to change one or more scope fields."""
+    console.print("[cyan]Which field do you want to change?[/cyan]")
+    for i, (field_key, label) in enumerate(_SCOPE_FIELDS, 1):
+        current = getattr(scope, field_key, "") or _SCOPE_DEFAULTS.get(field_key, "")
+        console.print(f"  {i}. {label}: [bold]{current}[/bold]")
+    console.print("  (Enter field number, or leave blank to stop editing)")
+
+    import dataclasses
+    scope_dict = dataclasses.asdict(scope)
+
+    while True:
+        try:
+            choice = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+        if not choice:
+            break
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(_SCOPE_FIELDS):
+                field_key, label = _SCOPE_FIELDS[idx]
+                current = scope_dict.get(field_key, "")
+                try:
+                    new_val = input(f"{label} [{current}]: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if new_val:
+                    if field_key == "from_manuscript":
+                        scope_dict[field_key] = new_val.lower() in ("true", "yes", "1")
+                    else:
+                        scope_dict[field_key] = new_val
+                console.print("  Change another field? (number or blank to finish)")
+        except (ValueError, IndexError):
+            pass
+
+    from models.state import SessionScope as SS
+    return SS(**scope_dict)
 
 
 # ---------------------------------------------------------------------------
